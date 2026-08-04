@@ -56,6 +56,37 @@ RUN_FIELDS = (
     "episode_count",
     "completed_episodes",
 )
+SELF_TRAINING_EPISODE_FIELDS = (
+    "global_episode",
+    "recorded_at",
+    "session_id",
+    "generation",
+    "stage",
+    "episode",
+    "total_steps",
+    "total_reward",
+    "completed",
+    "actor_loss",
+    "critic_loss",
+    "training_step",
+    "collisions",
+    "laser_emergency_stops",
+    "unrecovered_unsafe_events",
+    "stop_reason",
+)
+SELF_TRAINING_GENERATION_FIELDS = (
+    "recorded_at",
+    "session_id",
+    "generation",
+    "completed_training_episodes",
+    "parent_sha256",
+    "candidate_sha256",
+    "promoted",
+    "promotion_reason",
+    "offline_completed",
+    "unity_completed",
+    "unity_median_steps",
+)
 
 _REPORT_LOCK = threading.Lock()
 
@@ -119,6 +150,153 @@ class EpisodeReport:
             )
         if self.completed and reached_count != WAYPOINT_COUNT:
             raise ValueError("completed episode must reach all 13 waypoints")
+
+
+@dataclass(frozen=True)
+class SelfTrainingEpisodeReport:
+    session_id: str
+    generation: int
+    stage: str
+    episode: int
+    total_steps: int
+    total_reward: float
+    completed: bool
+    actor_loss: float
+    critic_loss: float
+    training_step: int
+    collisions: int = 0
+    laser_emergency_stops: int = 0
+    unrecovered_unsafe_events: int = 0
+    stop_reason: str = ""
+
+    def validate(self) -> None:
+        if not self.session_id or not self.stage:
+            raise ValueError("self-training session and stage are required")
+        integer_values = (
+            self.generation,
+            self.episode,
+            self.total_steps,
+            self.training_step,
+            self.collisions,
+            self.laser_emergency_stops,
+            self.unrecovered_unsafe_events,
+        )
+        if any(type(value) is not int or value < 0 for value in integer_values):
+            raise ValueError("self-training episode counters are invalid")
+        if type(self.completed) is not bool:
+            raise ValueError("self-training completion flag must be boolean")
+        if not all(
+            math.isfinite(float(value))
+            for value in (self.total_reward, self.actor_loss, self.critic_loss)
+        ):
+            raise ValueError("self-training episode metrics must be finite")
+
+
+@dataclass(frozen=True)
+class SelfTrainingGenerationReport:
+    session_id: str
+    generation: int
+    completed_training_episodes: int
+    parent_sha256: str
+    candidate_sha256: str
+    promoted: bool
+    promotion_reason: str
+    offline_completed: int
+    unity_completed: int
+    unity_median_steps: Optional[float]
+
+    def validate(self) -> None:
+        if not self.session_id or not self.promotion_reason:
+            raise ValueError("self-training generation identity is required")
+        if len(self.parent_sha256) != 64 or len(self.candidate_sha256) != 64:
+            raise ValueError("self-training generation hashes are invalid")
+        for value in (
+            self.generation,
+            self.completed_training_episodes,
+            self.offline_completed,
+            self.unity_completed,
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError("self-training generation counters are invalid")
+        if type(self.promoted) is not bool:
+            raise ValueError("self-training promotion flag must be boolean")
+        if self.unity_median_steps is not None and (
+            not math.isfinite(float(self.unity_median_steps))
+            or float(self.unity_median_steps) <= 0.0
+        ):
+            raise ValueError("self-training Unity median steps are invalid")
+
+
+class SelfTrainingReportLogger:
+    """Append hybrid-training evidence without changing the legacy reports."""
+
+    def __init__(self, reports_dir: Path = DEFAULT_REPORTS_DIR) -> None:
+        self.reports_dir = Path(reports_dir)
+
+    def record_episode(self, report: SelfTrainingEpisodeReport) -> int:
+        report.validate()
+        with _REPORT_LOCK:
+            self.reports_dir.mkdir(parents=True, exist_ok=True)
+            path = self.reports_dir / "self_training_episodes.csv"
+            rows = _read_csv(path, SELF_TRAINING_EPISODE_FIELDS)
+            global_episode = 1 + max(
+                (int(row["global_episode"]) for row in rows),
+                default=0,
+            )
+            rows.append(
+                {
+                    "global_episode": str(global_episode),
+                    "recorded_at": _utc_text(datetime.now(timezone.utc)),
+                    "session_id": report.session_id,
+                    "generation": str(report.generation),
+                    "stage": report.stage,
+                    "episode": str(report.episode),
+                    "total_steps": str(report.total_steps),
+                    "total_reward": _format_float(report.total_reward),
+                    "completed": "1" if report.completed else "0",
+                    "actor_loss": _format_float(report.actor_loss),
+                    "critic_loss": _format_float(report.critic_loss),
+                    "training_step": str(report.training_step),
+                    "collisions": str(report.collisions),
+                    "laser_emergency_stops": str(report.laser_emergency_stops),
+                    "unrecovered_unsafe_events": str(report.unrecovered_unsafe_events),
+                    "stop_reason": report.stop_reason,
+                }
+            )
+            _write_csv(path, SELF_TRAINING_EPISODE_FIELDS, rows)
+            _render_self_training_reports(self.reports_dir, rows)
+            return global_episode
+
+    def record_generation(self, report: SelfTrainingGenerationReport) -> None:
+        report.validate()
+        with _REPORT_LOCK:
+            self.reports_dir.mkdir(parents=True, exist_ok=True)
+            path = self.reports_dir / "self_training_generations.csv"
+            rows = _read_csv(path, SELF_TRAINING_GENERATION_FIELDS)
+            if any(
+                row["session_id"] == report.session_id
+                and int(row["generation"]) == report.generation
+                for row in rows
+            ):
+                raise ValueError("self-training generation is already recorded")
+            rows.append(
+                {
+                    "recorded_at": _utc_text(datetime.now(timezone.utc)),
+                    "session_id": report.session_id,
+                    "generation": str(report.generation),
+                    "completed_training_episodes": str(report.completed_training_episodes),
+                    "parent_sha256": report.parent_sha256,
+                    "candidate_sha256": report.candidate_sha256,
+                    "promoted": "1" if report.promoted else "0",
+                    "promotion_reason": report.promotion_reason,
+                    "offline_completed": str(report.offline_completed),
+                    "unity_completed": str(report.unity_completed),
+                    "unity_median_steps": (
+                        "" if report.unity_median_steps is None else _format_float(report.unity_median_steps)
+                    ),
+                }
+            )
+            _write_csv(path, SELF_TRAINING_GENERATION_FIELDS, rows)
 
 
 @dataclass(frozen=True)
@@ -457,6 +635,67 @@ def _optional_number(value: str) -> Optional[float]:
     return None if value == "" else float(value)
 
 
+def _render_self_training_reports(
+    reports_dir: Path,
+    rows: list[dict[str, str]],
+) -> None:
+    ordered = sorted(rows, key=lambda row: int(row["global_episode"]))
+    values = tuple(float(row["global_episode"]) for row in ordered)
+    _render_line_chart(
+        reports_dir / "self_training_reward.svg",
+        title="Self-training Episode Reward",
+        y_label="Reward",
+        series=(
+            _Series(
+                "Reward",
+                tuple((episode, float(row["total_reward"])) for episode, row in zip(values, ordered)),
+                _SERIES_STYLES[0][0],
+            ),
+        ),
+    )
+    successes = 0
+    success_values = []
+    for index, (episode, row) in enumerate(zip(values, ordered), start=1):
+        successes += int(row["completed"])
+        success_values.append((episode, successes / index))
+    _render_line_chart(
+        reports_dir / "self_training_success_rate.svg",
+        title="Self-training Cumulative Success Rate",
+        y_label="Success rate",
+        series=(_Series("Success rate", tuple(success_values), _SERIES_STYLES[0][0]),),
+    )
+    _render_line_chart(
+        reports_dir / "self_training_total_steps.svg",
+        title="Self-training Episode Total Steps",
+        y_label="Total steps",
+        series=(
+            _Series(
+                "Total steps",
+                tuple((episode, float(row["total_steps"])) for episode, row in zip(values, ordered)),
+                _SERIES_STYLES[0][0],
+            ),
+        ),
+    )
+    _render_line_chart(
+        reports_dir / "self_training_losses.svg",
+        title="Self-training SAC Loss",
+        y_label="Loss",
+        series=(
+            _Series(
+                "Actor loss",
+                tuple((episode, float(row["actor_loss"])) for episode, row in zip(values, ordered)),
+                _SERIES_STYLES[0][0],
+            ),
+            _Series(
+                "Critic loss",
+                tuple((episode, float(row["critic_loss"])) for episode, row in zip(values, ordered)),
+                _SERIES_STYLES[1][0],
+                _SERIES_STYLES[1][1],
+            ),
+        ),
+    )
+
+
 def _render_line_chart(
     path: Path,
     *,
@@ -487,12 +726,18 @@ def _render_line_chart(
     ]
     x_max = max(2.0, max(all_x, default=1.0))
     y_max = _nice_upper(max(all_values, default=1.0))
+    y_min = (
+        -_nice_upper(abs(min(all_values)))
+        if all_values and min(all_values) < 0.0
+        else 0.0
+    )
+    y_span = y_max - y_min
 
     def x_position(value: float) -> float:
         return left + plot_width * value / x_max
 
     def y_position(value: float) -> float:
-        return top + plot_height * (1.0 - value / y_max)
+        return top + plot_height * (1.0 - (value - y_min) / y_span)
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -551,7 +796,7 @@ def _render_line_chart(
             f'{_axis_number(value)}</text>'
         )
     for index in range(y_ticks + 1):
-        value = y_max * index / y_ticks
+        value = y_min + y_span * index / y_ticks
         y = y_position(value)
         lines.append(
             f'<line x1="{left - 6:.2f}" y1="{y:.2f}" '
@@ -649,5 +894,8 @@ def _axis_number(value: float) -> str:
 __all__ = [
     "DEFAULT_REPORTS_DIR",
     "EpisodeReport",
+    "SelfTrainingEpisodeReport",
+    "SelfTrainingGenerationReport",
+    "SelfTrainingReportLogger",
     "TrainingReportLogger",
 ]

@@ -8,8 +8,8 @@ aretifacts/
 # Project-local training and evaluation outputs.
 artifacts/checkpoints/
 artifacts/logs/
-artifacts/ros_archive/
 # Runtime training reports remain local while their documentation is tracked.
 reports/*.csv
 reports/*.svg
 reports/*.tmp
+reports/self_training_state/

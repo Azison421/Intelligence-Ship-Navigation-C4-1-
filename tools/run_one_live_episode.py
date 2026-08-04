@@ -18,11 +18,16 @@ from usvlib4ros.usvRosUtil import USVRosbridgeClient
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MAX_EPISODE_SECONDS = 600.0
 
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=MAX_EPISODE_SECONDS,
+    )
     parser.add_argument(
         "--no-reset",
         action="store_true",
@@ -33,8 +38,8 @@ def _arguments() -> argparse.Namespace:
 
 def main() -> int:
     args = _arguments()
-    if not 0.0 < args.max_seconds <= 300.0:
-        raise ValueError("max-seconds must be in (0, 300]")
+    if not 0.0 < args.max_seconds <= MAX_EPISODE_SECONDS:
+        raise ValueError("max-seconds must be in (0, 600]")
     config = json.loads(
         (PROJECT_ROOT / "config.json").read_text(encoding="utf-8")
     )["ros2"]

@@ -27,12 +27,17 @@ from usvlib4ros.usvRosUtil import USVRosbridgeClient
 
 
 OUTPUT_DIR = PROJECT_ROOT / "artifacts" / "logs"
+MAX_EPISODE_SECONDS = 600.0
 
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("--max-seconds", type=float, default=300.0)
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=MAX_EPISODE_SECONDS,
+    )
     return parser.parse_args()
 
 
@@ -80,8 +85,8 @@ def _passed(metrics: dict, completed: bool, max_seconds: float) -> bool:
 def main() -> int:
     args = _arguments()
     checkpoint = args.checkpoint.resolve()
-    if not 0.0 < args.max_seconds <= 300.0:
-        raise ValueError("max-seconds must be in (0, 300]")
+    if not 0.0 < args.max_seconds <= MAX_EPISODE_SECONDS:
+        raise ValueError("max-seconds must be in (0, 600]")
     manifest = _candidate_manifest(checkpoint)
 
     config = json.loads(

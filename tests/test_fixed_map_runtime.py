@@ -10,9 +10,14 @@ from usvlib4ros.mapping import GpsProjector
 from usvlib4ros.navigation.fixed_map_runtime import (
     DEFAULT_CHECKPOINT,
     FixedMapControllerCore,
+    RuntimeManeuverProfile,
+    RuntimeSafetyProfile,
     RuntimeInput,
     build_live_route_context,
     load_live_ready_policy,
+    load_tested_candidate_policy,
+    runtime_maneuver_profile_from_manifest,
+    runtime_safety_profile_from_manifest,
 )
 from usvlib4ros.navigation.reverse_control_calibration import (
     ReverseControlProfile,
@@ -69,6 +74,77 @@ def test_runtime_defaults_to_operator_tested_candidate_checkpoint():
     )
 
 
+def test_v5_live_loader_enables_full_predictive_safe_mask_authority_without_changing_v4(tmp_path):
+    source = (
+        __import__("pathlib").Path("artifacts/checkpoints")
+        / "national_test_sac_v37_zero_clearance_conservative_345_unity_test.pt"
+    )
+    candidate = tmp_path / "generation-001.pt"
+    candidate.write_bytes(source.read_bytes())
+    manifest = json.loads(
+        source.with_suffix(".pt.json").read_text(encoding="utf-8")
+    )
+    manifest.update(
+        {
+            "schema_version": "national-test-sac-checkpoint-v5",
+            "checkpoint_sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            "policy_gate_version": "sac-predictive-safe-mask-v1",
+            "offline_ready": True,
+            "live_ready": True,
+            "unity_validation_log_hashes": [f"embedded-{index}" for index in range(5)],
+            "evaluation_evidence": {
+                "offline": {
+                    "attempted": 20,
+                    "completed": 20,
+                    "collisions": 0,
+                    "laser_stops": 0,
+                    "safety_stops": 0,
+                    "timeouts": 0,
+                    "unrecovered_unsafe_events": 0,
+                },
+                "unity": {
+                    "attempted": 5,
+                    "completed": 5,
+                    "collisions": 0,
+                    "laser_stops": 0,
+                    "safety_stops": 0,
+                    "timeouts": 0,
+                    "unrecovered_unsafe_events": 0,
+                },
+            },
+            "promotion_decision": {"promote": True},
+        }
+    )
+    manifest["safety_profile"]["unity_test_only"] = False
+    manifest["clearance_maneuver_profile"]["unity_test_only"] = False
+    candidate.with_suffix(".pt.json").write_text(json.dumps(manifest), encoding="utf-8")
+    route, pose = _live_route_and_pose()
+    safety = runtime_safety_profile_from_manifest(manifest)
+    maneuver = runtime_maneuver_profile_from_manifest(manifest)
+    context = build_live_route_context(
+        route,
+        pose,
+        session_id="v5-live-loader",
+        safety_profile=safety,
+        maneuver_profile=maneuver,
+    )
+
+    v5 = load_live_ready_policy(candidate, context)
+    original_manifest = json.loads(source.with_suffix(".pt.json").read_text(encoding="utf-8"))
+    v4_context = build_live_route_context(
+        route,
+        pose,
+        session_id="v4-loader",
+        safety_profile=runtime_safety_profile_from_manifest(original_manifest),
+        maneuver_profile=runtime_maneuver_profile_from_manifest(original_manifest),
+    )
+    v4 = load_tested_candidate_policy(source, v4_context)
+
+    assert v5.full_safe_action_authority is True
+    assert v4.full_safe_action_authority is False
+    assert FixedMapControllerCore(context, v5).full_safe_action_authority is True
+
+
 def _runtime_state(context):
     manifest = context.compiled_map.manifest
     first, second = manifest.route_points_enu[:2]
@@ -119,6 +195,310 @@ def test_live_route_context_accepts_only_approved_national_route():
             pose,
             session_id="wrong-route-test",
         )
+
+
+def test_runtime_safety_profile_keeps_legacy_defaults_and_parses_zero():
+    from usvlib4ros.navigation.fixed_map_runtime import (
+        runtime_safety_profile_from_manifest,
+    )
+
+    baseline = runtime_safety_profile_from_manifest({})
+    zero = runtime_safety_profile_from_manifest(
+        {
+            "safety_profile": {
+                "id": "national-test-zero-clearance-unity-v1",
+                "required_clearance_m": 0.0,
+                "laser_emergency_distance_m": 0.0,
+                "unity_test_only": True,
+            }
+        }
+    )
+
+    assert baseline.required_clearance_m == 0.2
+    assert baseline.laser_emergency_distance_m == 0.6
+    assert not baseline.unity_test_only
+    assert zero.required_clearance_m == 0.0
+    assert zero.laser_emergency_distance_m == 0.0
+    assert zero.unity_test_only
+
+    with pytest.raises(ValueError, match="invalid"):
+        runtime_safety_profile_from_manifest(
+            {
+                "safety_profile": {
+                    "id": "invalid-negative-clearance",
+                    "required_clearance_m": -0.1,
+                    "laser_emergency_distance_m": 0.0,
+                    "unity_test_only": True,
+                }
+            }
+        )
+
+
+def test_runtime_maneuver_profile_keeps_legacy_defaults_and_parses_slow_turn():
+    from usvlib4ros.navigation.fixed_map_runtime import (
+        runtime_maneuver_profile_from_manifest,
+    )
+
+    baseline = runtime_maneuver_profile_from_manifest({})
+    slow = runtime_maneuver_profile_from_manifest(
+        {
+            "clearance_maneuver_profile": {
+                "id": "points-three-five-conservative-unity-v2",
+                "approach_throttle_cap": 0.1,
+                "approach_rudder_cap": 0.1,
+                "turn_throttle": 0.1,
+                "turn_rudder": 0.12,
+                "turn_max_edges": 180,
+                "turn_entry_speed_limit_mps": 0.15,
+                "unity_test_only": True,
+            }
+        }
+    )
+
+    assert baseline.approach_throttle_cap == 0.4
+    assert baseline.approach_rudder_cap == 1.0
+    assert baseline.turn_control == Control(0.4, 0.2)
+    assert baseline.turn_max_edges == 80
+    assert not baseline.unity_test_only
+    assert slow.approach_throttle_cap == 0.1
+    assert slow.approach_rudder_cap == 0.1
+    assert slow.turn_control == Control(0.1, 0.12)
+    assert slow.turn_max_edges == 180
+    assert slow.turn_entry_speed_limit_mps == 0.15
+    assert slow.unity_test_only
+
+    with pytest.raises(ValueError, match="invalid"):
+        runtime_maneuver_profile_from_manifest(
+            {
+                "clearance_maneuver_profile": {
+                    "id": "invalid-fast-profile",
+                    "approach_throttle_cap": 1.1,
+                    "approach_rudder_cap": 0.1,
+                    "turn_throttle": 0.1,
+                    "turn_rudder": 0.15,
+                    "turn_max_edges": 180,
+                    "turn_entry_speed_limit_mps": 0.15,
+                    "unity_test_only": True,
+                }
+            }
+        )
+
+
+def test_zero_clearance_map_removes_buffer_but_keeps_footprint_collision():
+    baseline = compile_offline_national_map(session_id="baseline-clearance")
+    zero = compile_offline_national_map(
+        session_id="zero-clearance",
+        required_clearance_m=0.0,
+    )
+    near_obstacle = VesselState(
+        x=38.56912943606869,
+        y=73.6600965399968,
+        yaw=1.102951261381084,
+        speed=0.0,
+        yaw_rate=0.0,
+        stamp_sim=0.0,
+    )
+    obstacle = zero.snapshot.circular_obstacles[0]
+    collision = VesselState(
+        x=obstacle.x,
+        y=obstacle.y,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+        stamp_sim=0.0,
+    )
+
+    assert 0.0 < baseline.snapshot.clearance_at(near_obstacle) < 0.2
+    assert not baseline.snapshot.is_state_valid(near_obstacle)
+    assert zero.snapshot.is_state_valid(near_obstacle)
+    assert zero.snapshot.footprint_radius == baseline.snapshot.footprint_radius
+    assert zero.snapshot.payload_content_hash != baseline.snapshot.payload_content_hash
+    assert not zero.snapshot.is_state_valid(collision)
+
+
+def test_zero_clearance_runtime_only_stops_laser_at_contact():
+    from usvlib4ros.navigation.fixed_map_runtime import (
+        RuntimeSafetyProfile,
+    )
+
+    route, pose = _live_route_and_pose()
+    profile = RuntimeSafetyProfile(
+        profile_id="national-test-zero-clearance-unity-v1",
+        required_clearance_m=0.0,
+        laser_emergency_distance_m=0.0,
+        unity_test_only=True,
+    )
+    context = build_live_route_context(
+        route,
+        pose,
+        session_id="zero-laser-threshold",
+        safety_profile=profile,
+    )
+    policy = RecurrentDiscreteSAC(
+        observation_dim=162,
+        hidden_dim=16,
+        seed=31,
+    )
+
+    positive = FixedMapControllerCore(context, policy).step(
+        _sample(
+            context,
+            laser_ranges=(0.01,) + (20.0,) * 71,
+            laser_valid_mask=(True,) + (False,) * 71,
+        )
+    )
+    contact = FixedMapControllerCore(context, policy).step(
+        _sample(
+            context,
+            laser_ranges=(0.0,) + (20.0,) * 71,
+            laser_valid_mask=(True,) + (False,) * 71,
+        )
+    )
+
+    assert positive.reason != "LASER_EMERGENCY_STOP"
+    assert contact.stop
+    assert contact.reason == "LASER_EMERGENCY_STOP"
+
+
+def test_zero_clearance_candidate_reuses_v37_weights_and_is_unity_only():
+    from usvlib4ros.navigation.fixed_map_runtime import (
+        DEFAULT_UNITY_TEST_CHECKPOINT,
+        load_runtime_maneuver_profile,
+        load_runtime_safety_profile,
+        load_tested_candidate_policy,
+    )
+    from usvlib4ros.policy.checkpoint_promotion import PolicyMode
+
+    baseline_checkpoint = (
+        DEFAULT_UNITY_TEST_CHECKPOINT.parent
+        / "national_test_sac_v37_unity_test.pt"
+    )
+    previous_zero_checkpoint = (
+        DEFAULT_UNITY_TEST_CHECKPOINT.parent
+        / "national_test_sac_v37_zero_clearance_unity_test.pt"
+    )
+    previous_slow_checkpoint = (
+        DEFAULT_UNITY_TEST_CHECKPOINT.parent
+        / "national_test_sac_v37_zero_clearance_slow_turn_unity_test.pt"
+    )
+    manifest = json.loads(
+        DEFAULT_UNITY_TEST_CHECKPOINT.with_suffix(".pt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert DEFAULT_UNITY_TEST_CHECKPOINT.name == (
+        "national_test_sac_v37_zero_clearance_conservative_345_unity_test.pt"
+    )
+    assert hashlib.sha256(DEFAULT_UNITY_TEST_CHECKPOINT.read_bytes()).digest() == (
+        hashlib.sha256(baseline_checkpoint.read_bytes()).digest()
+    )
+    assert manifest["offline_ready"] is False
+    assert manifest["live_ready"] is False
+    profile = load_runtime_safety_profile(
+        DEFAULT_UNITY_TEST_CHECKPOINT,
+        PolicyMode.UNITY_TEST,
+    )
+    maneuver_profile = load_runtime_maneuver_profile(
+        DEFAULT_UNITY_TEST_CHECKPOINT,
+        PolicyMode.UNITY_TEST,
+    )
+    with pytest.raises(ValueError, match="unity_test"):
+        load_runtime_safety_profile(
+            DEFAULT_UNITY_TEST_CHECKPOINT,
+            PolicyMode.LIVE,
+        )
+    with pytest.raises(ValueError, match="unity_test"):
+        load_runtime_maneuver_profile(
+            DEFAULT_UNITY_TEST_CHECKPOINT,
+            PolicyMode.LIVE,
+        )
+
+    route, pose = _live_route_and_pose()
+    context = build_live_route_context(
+        route,
+        pose,
+        session_id="zero-candidate-load",
+        safety_profile=profile,
+        maneuver_profile=maneuver_profile,
+    )
+    policy = load_tested_candidate_policy(
+        DEFAULT_UNITY_TEST_CHECKPOINT,
+        context,
+    )
+    core = FixedMapControllerCore(context, policy)
+    core.mission_index = 3
+    decision = core.step(
+        _sample(
+            context,
+            vessel_state=VesselState(
+                x=39.99182511134593,
+                y=77.3913731240417,
+                yaw=1.2087803047104109,
+                speed=0.12681330183438116,
+                yaw_rate=0.007204442569118387,
+                stamp_sim=65.5,
+            ),
+        )
+    )
+    baseline_context = build_live_route_context(
+        route,
+        pose,
+        session_id="baseline-candidate-load",
+    )
+    baseline_policy = load_tested_candidate_policy(
+        baseline_checkpoint,
+        baseline_context,
+    )
+    previous_zero_safety = load_runtime_safety_profile(
+        previous_zero_checkpoint,
+        PolicyMode.UNITY_TEST,
+    )
+    previous_zero_maneuver = load_runtime_maneuver_profile(
+        previous_zero_checkpoint,
+        PolicyMode.UNITY_TEST,
+    )
+    previous_zero_context = build_live_route_context(
+        route,
+        pose,
+        session_id="previous-zero-candidate-load",
+        safety_profile=previous_zero_safety,
+        maneuver_profile=previous_zero_maneuver,
+    )
+    previous_zero_policy = load_tested_candidate_policy(
+        previous_zero_checkpoint,
+        previous_zero_context,
+    )
+
+    assert context.compiled_map.snapshot.required_clearance == 0.0
+    assert context.maneuver_profile.approach_throttle_cap == 0.1
+    assert context.maneuver_profile.approach_rudder_cap == 0.1
+    assert context.maneuver_profile.turn_control == Control(0.1, 0.12)
+    assert policy.observation_dim == 162
+    assert not decision.stop
+    assert decision.control is not None
+    assert decision.control.throttle <= 0.1
+    assert core.trajectory is not None
+    assert max(
+        control.throttle for control in core.trajectory.controls
+    ) <= 0.1
+    assert max(
+        abs(control.rudder) for control in core.trajectory.controls
+    ) <= 0.1
+    assert baseline_context.compiled_map.snapshot.required_clearance == 0.2
+    assert baseline_policy.observation_dim == 162
+    assert previous_zero_context.compiled_map.snapshot.required_clearance == 0.0
+    assert previous_zero_context.maneuver_profile.turn_control == Control(
+        0.4,
+        0.2,
+    )
+    assert previous_zero_policy.observation_dim == 162
+    previous_slow_profile = load_runtime_maneuver_profile(
+        previous_slow_checkpoint,
+        PolicyMode.UNITY_TEST,
+    )
+    assert previous_slow_profile.approach_rudder_cap == 1.0
+    assert previous_slow_profile.turn_control == Control(0.1, 0.15)
 
 
 def test_runtime_core_plans_then_emits_only_fresh_safe_control():

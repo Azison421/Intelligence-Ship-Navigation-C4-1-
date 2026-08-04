@@ -47,9 +47,13 @@ CLEARANCE_COMPOSITE_ROUTE_INDEX = 3
 CLEARANCE_APPROACH_GATE = (39.9, 78.8, 0.5)
 CLEARANCE_HANDOFF_XY = (39.0, 82.9)
 CLEARANCE_HANDOFF_TOLERANCE_M = 0.6
+CLEARANCE_APPROACH_THROTTLE_CAP = 0.4
+CLEARANCE_APPROACH_RUDDER_CAP = 1.0
 CLEARANCE_TURN_CONTROL = Control(0.4, 0.2)
 CLEARANCE_TURN_BRAKE_CONTROL = Control(-0.4, 0.0)
 CLEARANCE_TURN_EDGE_DURATION_S = 0.2
+CLEARANCE_TURN_MAX_EDGES = 80
+CLEARANCE_TURN_ENTRY_SPEED_LIMIT_MPS = 0.15
 CLEARANCE_EXIT_TURN_CONTROL = Control(0.4, -0.2)
 CLEARANCE_EXIT_TAIL_CONTROLS = (
     Control(0.1, 0.2),
@@ -466,9 +470,30 @@ def plan_clearance_turn(
     *,
     start_state: VesselState,
     dynamics: PrototypeReducedDynamics,
+    turn_control: Control = CLEARANCE_TURN_CONTROL,
+    turn_max_edges: int = CLEARANCE_TURN_MAX_EDGES,
+    turn_entry_speed_limit_mps: float = (
+        CLEARANCE_TURN_ENTRY_SPEED_LIMIT_MPS
+    ),
 ) -> Trajectory:
     """Propagate the calibrated clockwise arc from the west gate."""
 
+    if (
+        not isinstance(turn_control, Control)
+        or not math.isfinite(turn_control.throttle)
+        or not math.isfinite(turn_control.rudder)
+        or not 0.0 < turn_control.throttle <= 1.0
+        or abs(turn_control.rudder) > 1.0
+        or isinstance(turn_max_edges, bool)
+        or not isinstance(turn_max_edges, int)
+        or turn_max_edges <= 0
+        or isinstance(turn_entry_speed_limit_mps, bool)
+        or not isinstance(turn_entry_speed_limit_mps, (int, float))
+        or not math.isfinite(float(turn_entry_speed_limit_mps))
+        or float(turn_entry_speed_limit_mps) <= 0.0
+    ):
+        raise ValueError("clearance turn profile is invalid")
+    turn_entry_speed_limit_mps = float(turn_entry_speed_limit_mps)
     if not clearance_handoff_reached(compiled_map, start_state):
         raise RuntimeError("clearance turn must start in the handoff")
     snapshot = compiled_map.snapshot
@@ -495,14 +520,14 @@ def plan_clearance_turn(
         return states[-1]
 
     for _ in range(20):
-        if states[-1].speed <= 0.15:
+        if states[-1].speed <= turn_entry_speed_limit_mps:
             break
         append(CLEARANCE_TURN_BRAKE_CONTROL)
     else:
         raise RuntimeError("clearance turn braking did not settle")
 
-    for _ in range(80):
-        append(CLEARANCE_TURN_CONTROL)
+    for _ in range(turn_max_edges):
+        append(turn_control)
         if fixed_route_waypoint_reached(compiled_map, 4, states[-1]):
             break
     else:
@@ -1311,8 +1336,18 @@ def compile_offline_national_map(
     *,
     session_id: str,
     stamp_sim: float = 0.0,
+    required_clearance_m: float = 0.2,
 ) -> CompiledSidecarMap:
-    """Compile the current verified live affine profile without ROS access."""
+    """Compile the live affine profile with an explicit collision buffer."""
+
+    if (
+        isinstance(required_clearance_m, bool)
+        or not isinstance(required_clearance_m, (int, float))
+        or not math.isfinite(float(required_clearance_m))
+        or float(required_clearance_m) < 0.0
+    ):
+        raise ValueError("required_clearance_m must be finite and non-negative")
+    required_clearance_m = float(required_clearance_m)
 
     artifact, artifact_hash = load_sidecar_artifact(SIDECAR_PATH)
     profile = json.loads(LIVE_PROFILE_PATH.read_text(encoding="utf-8"))
@@ -1333,9 +1368,10 @@ def compile_offline_national_map(
         session_id=session_id,
         stamp_sim=stamp_sim,
         config=SidecarCompilerConfig(
-            required_clearance_m=0.2,
+            required_clearance_m=required_clearance_m,
             geometry_version=(
-                "circle-0.4-margin-0.2-live-recovery-v1"
+                "circle-0.4-margin-"
+                f"{required_clearance_m}-live-recovery-v1"
             ),
             transform_model="route_fitted_affine",
             coverage_status="complete_prior",
@@ -1358,6 +1394,10 @@ def plan_fixed_leg(
     optimize_with_rrtstar: bool = False,
     seed: int = 31,
     forward_action_controls: tuple[Control, ...] = (),
+    clearance_approach_throttle_cap: float = (
+        CLEARANCE_APPROACH_THROTTLE_CAP
+    ),
+    clearance_approach_rudder_cap: float = CLEARANCE_APPROACH_RUDDER_CAP,
     narrow_visit_completed: bool = False,
     clearance_approach_completed: bool = False,
     _allow_retry: bool = True,
@@ -1379,6 +1419,24 @@ def plan_fixed_leg(
         raise ValueError("fixed leg start state is not valid")
     if not math.isfinite(time_budget_ms) or time_budget_ms <= 0.0:
         raise ValueError("time_budget_ms must be positive and finite")
+    if (
+        isinstance(clearance_approach_throttle_cap, bool)
+        or not isinstance(clearance_approach_throttle_cap, (int, float))
+        or not math.isfinite(float(clearance_approach_throttle_cap))
+        or not 0.0 < float(clearance_approach_throttle_cap) <= 1.0
+    ):
+        raise ValueError("clearance approach throttle cap is invalid")
+    clearance_approach_throttle_cap = float(
+        clearance_approach_throttle_cap
+    )
+    if (
+        isinstance(clearance_approach_rudder_cap, bool)
+        or not isinstance(clearance_approach_rudder_cap, (int, float))
+        or not math.isfinite(float(clearance_approach_rudder_cap))
+        or not 0.0 < float(clearance_approach_rudder_cap) <= 1.0
+    ):
+        raise ValueError("clearance approach rudder cap is invalid")
+    clearance_approach_rudder_cap = float(clearance_approach_rudder_cap)
     if (
         mission_index == NARROW_ROUTE_INDEX
         and narrow_visit_completed
@@ -1407,6 +1465,17 @@ def plan_fixed_leg(
             if control.throttle >= 0.0
         )
     )
+    if mission_index == CLEARANCE_COMPOSITE_ROUTE_INDEX:
+        planner_controls = tuple(
+            Control(
+                min(control.throttle, clearance_approach_throttle_cap),
+                max(
+                    -clearance_approach_rudder_cap,
+                    min(clearance_approach_rudder_cap, control.rudder),
+                ),
+            )
+            for control in planner_controls
+        )
     result = None
     ordinary_clearance_floor = min(
         ORDINARY_PLAN_CLEARANCE_BY_INDEX.get(
@@ -1548,6 +1617,10 @@ def plan_fixed_leg(
             optimize_with_rrtstar=optimize_with_rrtstar,
             seed=seed + 10_009,
             forward_action_controls=forward_action_controls,
+            clearance_approach_throttle_cap=(
+                clearance_approach_throttle_cap
+            ),
+            clearance_approach_rudder_cap=clearance_approach_rudder_cap,
             narrow_visit_completed=narrow_visit_completed,
             clearance_approach_completed=clearance_approach_completed,
             _allow_retry=False,

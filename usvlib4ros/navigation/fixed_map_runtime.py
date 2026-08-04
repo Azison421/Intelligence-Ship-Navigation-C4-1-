@@ -83,9 +83,11 @@ from usvlib4ros.policy.fixed_map_features import (
     trajectory_replan_required,
 )
 from usvlib4ros.policy.recurrent_sac import (
+    LocalObservationV2,
     RecurrentDiscreteSAC,
     RecurrentHiddenState,
 )
+from usvlib4ros.policy.checkpoint_promotion import PolicyMode
 from usvlib4ros.policy.safety_supervisor import (
     CandidateControl,
     CandidateControlGenerator,
@@ -94,6 +96,11 @@ from usvlib4ros.policy.safety_supervisor import (
     PREDICTION_HORIZON_POLICY_VERSION,
     PredictiveSafetySupervisor,
     minimum_intervention_action,
+)
+from usvlib4ros.policy.self_training import (
+    SAFE_MASK_POLICY_GATE_VERSION,
+    V5_CHECKPOINT_SCHEMA,
+    bounded_safe_action_controls,
 )
 
 
@@ -108,7 +115,7 @@ DEFAULT_UNITY_TEST_CHECKPOINT = (
     PROJECT_ROOT
     / "artifacts"
     / "checkpoints"
-    / "national_test_sac_v37_unity_test.pt"
+    / "national_test_sac_v37_zero_clearance_conservative_345_unity_test.pt"
 )
 ROUTE_FIT_TOLERANCE_M = 0.05
 APPROVED_TRANSFORM_TOLERANCE_M = 0.05
@@ -122,6 +129,222 @@ CLEARANCE_RECOVERY_MAX_SPEED_MPS = 0.15
 CLEARANCE_RECOVERY_CONTROL = Control(0.1, 0.0)
 PLANNING_MAX_SPEED_MPS = 0.15
 PLANNING_BRAKE_CONTROL = Control(-0.4, 0.0)
+V4_CHECKPOINT_SCHEMA = "national-test-sac-checkpoint-v4"
+SUPPORTED_CHECKPOINT_SCHEMAS = frozenset(
+    {V4_CHECKPOINT_SCHEMA, V5_CHECKPOINT_SCHEMA}
+)
+
+
+@dataclass(frozen=True)
+class RuntimeSafetyProfile:
+    """Manifest-bound collision buffer used by one Unity run."""
+
+    profile_id: str
+    required_clearance_m: float
+    laser_emergency_distance_m: float
+    unity_test_only: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.profile_id, str)
+            or not self.profile_id.strip()
+            or isinstance(self.required_clearance_m, bool)
+            or isinstance(self.laser_emergency_distance_m, bool)
+            or not isinstance(self.required_clearance_m, (int, float))
+            or not isinstance(self.laser_emergency_distance_m, (int, float))
+            or not math.isfinite(float(self.required_clearance_m))
+            or not math.isfinite(float(self.laser_emergency_distance_m))
+            or float(self.required_clearance_m) < 0.0
+            or float(self.laser_emergency_distance_m) < 0.0
+            or not isinstance(self.unity_test_only, bool)
+        ):
+            raise ValueError("runtime safety profile is invalid")
+        object.__setattr__(self, "profile_id", self.profile_id.strip())
+        object.__setattr__(
+            self,
+            "required_clearance_m",
+            float(self.required_clearance_m),
+        )
+        object.__setattr__(
+            self,
+            "laser_emergency_distance_m",
+            float(self.laser_emergency_distance_m),
+        )
+
+
+BASELINE_RUNTIME_SAFETY_PROFILE = RuntimeSafetyProfile(
+    profile_id="national-test-baseline-clearance-v1",
+    required_clearance_m=0.2,
+    laser_emergency_distance_m=LASER_EMERGENCY_DISTANCE_M,
+    unity_test_only=False,
+)
+
+
+def runtime_safety_profile_from_manifest(
+    manifest: dict,
+) -> RuntimeSafetyProfile:
+    """Parse an optional profile; legacy manifests keep baseline behavior."""
+
+    if not isinstance(manifest, dict):
+        raise ValueError("checkpoint manifest must be an object")
+    payload = manifest.get("safety_profile")
+    if payload is None:
+        return BASELINE_RUNTIME_SAFETY_PROFILE
+    if not isinstance(payload, dict):
+        raise ValueError("checkpoint safety_profile must be an object")
+    try:
+        return RuntimeSafetyProfile(
+            profile_id=payload["id"],
+            required_clearance_m=payload["required_clearance_m"],
+            laser_emergency_distance_m=(
+                payload["laser_emergency_distance_m"]
+            ),
+            unity_test_only=payload["unity_test_only"],
+        )
+    except KeyError as exc:
+        raise ValueError("checkpoint safety_profile is incomplete") from exc
+
+
+def load_runtime_safety_profile(
+    checkpoint_path: Path,
+    policy_mode: PolicyMode,
+) -> RuntimeSafetyProfile:
+    """Load and mode-check the safety profile before building the map."""
+
+    checkpoint = Path(checkpoint_path)
+    manifest_path = checkpoint.with_suffix(checkpoint.suffix + ".json")
+    if not manifest_path.is_file():
+        raise FileNotFoundError("SAC checkpoint manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMAS:
+        raise ValueError("SAC checkpoint manifest schema is incompatible")
+    profile = runtime_safety_profile_from_manifest(manifest)
+    if (
+        profile.unity_test_only
+        and PolicyMode(policy_mode) != PolicyMode.UNITY_TEST
+    ):
+        raise ValueError("runtime safety profile is restricted to unity_test")
+    return profile
+
+
+@dataclass(frozen=True)
+class RuntimeManeuverProfile:
+    """Manifest-bound point-four transit controls for one Unity run."""
+
+    profile_id: str
+    approach_throttle_cap: float
+    approach_rudder_cap: float
+    turn_throttle: float
+    turn_rudder: float
+    turn_max_edges: int
+    turn_entry_speed_limit_mps: float
+    unity_test_only: bool
+
+    def __post_init__(self) -> None:
+        numeric = (
+            self.approach_throttle_cap,
+            self.approach_rudder_cap,
+            self.turn_throttle,
+            self.turn_rudder,
+            self.turn_entry_speed_limit_mps,
+        )
+        if (
+            not isinstance(self.profile_id, str)
+            or not self.profile_id.strip()
+            or any(isinstance(value, bool) for value in numeric)
+            or not all(isinstance(value, (int, float)) for value in numeric)
+            or not all(math.isfinite(float(value)) for value in numeric)
+            or not 0.0 < float(self.approach_throttle_cap) <= 1.0
+            or not 0.0 < float(self.approach_rudder_cap) <= 1.0
+            or not 0.0 < float(self.turn_throttle) <= 1.0
+            or abs(float(self.turn_rudder)) > 1.0
+            or float(self.turn_entry_speed_limit_mps) <= 0.0
+            or isinstance(self.turn_max_edges, bool)
+            or not isinstance(self.turn_max_edges, int)
+            or self.turn_max_edges <= 0
+            or not isinstance(self.unity_test_only, bool)
+        ):
+            raise ValueError("runtime maneuver profile is invalid")
+        object.__setattr__(self, "profile_id", self.profile_id.strip())
+        for name in (
+            "approach_throttle_cap",
+            "approach_rudder_cap",
+            "turn_throttle",
+            "turn_rudder",
+            "turn_entry_speed_limit_mps",
+        ):
+            object.__setattr__(self, name, float(getattr(self, name)))
+
+    @property
+    def turn_control(self) -> Control:
+        return Control(self.turn_throttle, self.turn_rudder)
+
+
+BASELINE_RUNTIME_MANEUVER_PROFILE = RuntimeManeuverProfile(
+    profile_id="national-test-point-four-baseline-v1",
+    approach_throttle_cap=0.4,
+    approach_rudder_cap=1.0,
+    turn_throttle=0.4,
+    turn_rudder=0.2,
+    turn_max_edges=80,
+    turn_entry_speed_limit_mps=0.15,
+    unity_test_only=False,
+)
+
+
+def runtime_maneuver_profile_from_manifest(
+    manifest: dict,
+) -> RuntimeManeuverProfile:
+    """Parse optional point-four controls with a legacy-compatible fallback."""
+
+    if not isinstance(manifest, dict):
+        raise ValueError("checkpoint manifest must be an object")
+    payload = manifest.get("clearance_maneuver_profile")
+    if payload is None:
+        return BASELINE_RUNTIME_MANEUVER_PROFILE
+    if not isinstance(payload, dict):
+        raise ValueError(
+            "checkpoint clearance_maneuver_profile must be an object"
+        )
+    try:
+        return RuntimeManeuverProfile(
+            profile_id=payload["id"],
+            approach_throttle_cap=payload["approach_throttle_cap"],
+            approach_rudder_cap=payload.get("approach_rudder_cap", 1.0),
+            turn_throttle=payload["turn_throttle"],
+            turn_rudder=payload["turn_rudder"],
+            turn_max_edges=payload["turn_max_edges"],
+            turn_entry_speed_limit_mps=(
+                payload["turn_entry_speed_limit_mps"]
+            ),
+            unity_test_only=payload["unity_test_only"],
+        )
+    except KeyError as exc:
+        raise ValueError(
+            "checkpoint clearance_maneuver_profile is incomplete"
+        ) from exc
+
+
+def load_runtime_maneuver_profile(
+    checkpoint_path: Path,
+    policy_mode: PolicyMode,
+) -> RuntimeManeuverProfile:
+    """Load and mode-check point-four controls before building the context."""
+
+    checkpoint = Path(checkpoint_path)
+    manifest_path = checkpoint.with_suffix(checkpoint.suffix + ".json")
+    if not manifest_path.is_file():
+        raise FileNotFoundError("SAC checkpoint manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") not in SUPPORTED_CHECKPOINT_SCHEMAS:
+        raise ValueError("SAC checkpoint manifest schema is incompatible")
+    profile = runtime_maneuver_profile_from_manifest(manifest)
+    if (
+        profile.unity_test_only
+        and PolicyMode(policy_mode) != PolicyMode.UNITY_TEST
+    ):
+        raise ValueError("runtime maneuver profile is restricted to unity_test")
+    return profile
 
 
 @dataclass(frozen=True)
@@ -131,6 +354,10 @@ class LiveRouteContext:
     route_version: int
     start_index: int
     fit_residual_m: float
+    safety_profile: RuntimeSafetyProfile = BASELINE_RUNTIME_SAFETY_PROFILE
+    maneuver_profile: RuntimeManeuverProfile = (
+        BASELINE_RUNTIME_MANEUVER_PROFILE
+    )
 
 
 @dataclass(frozen=True)
@@ -157,10 +384,22 @@ class RuntimeDecision:
     completed: bool
     replanned: bool
     maneuver_phase: str = "NORMAL"
+    training_trace: Optional["RuntimeTrainingTrace"] = None
 
     @property
     def stop(self) -> bool:
         return self.control is None
+
+
+@dataclass(frozen=True)
+class RuntimeTrainingTrace:
+    observation: LocalObservationV2
+    executed_action: int
+    safe_action_mask: tuple[bool, ...]
+    mission_index: int
+    distance_to_goal_m: float
+    cross_track_error_m: float
+    map_clearance_m: float
 
 
 def _route_points(route) -> tuple[object, ...]:
@@ -210,8 +449,17 @@ def build_live_route_context(
     pose,
     *,
     session_id: str,
+    safety_profile: RuntimeSafetyProfile = BASELINE_RUNTIME_SAFETY_PROFILE,
+    maneuver_profile: RuntimeManeuverProfile = (
+        BASELINE_RUNTIME_MANEUVER_PROFILE
+    ),
 ) -> LiveRouteContext:
     """Bind the live route and ship pose to the approved static sidecar."""
+
+    if not isinstance(safety_profile, RuntimeSafetyProfile):
+        raise ValueError("runtime safety profile is invalid")
+    if not isinstance(maneuver_profile, RuntimeManeuverProfile):
+        raise ValueError("runtime maneuver profile is invalid")
 
     artifact, artifact_hash = load_sidecar_artifact(SIDECAR_PATH)
     expected_route = artifact["route"]
@@ -256,7 +504,10 @@ def build_live_route_context(
     ):
         raise ValueError("live route converter scale is implausible")
 
-    compiled = compile_offline_national_map(session_id=session_id)
+    compiled = compile_offline_national_map(
+        session_id=session_id,
+        required_clearance_m=safety_profile.required_clearance_m,
+    )
     approved = AffineTransform2D(
         *json.loads(
             (
@@ -292,6 +543,8 @@ def build_live_route_context(
         route_version=int(getattr(route, "version", 0) or 0),
         start_index=int(getattr(route, "start_index", 0) or 0),
         fit_residual_m=max_residual,
+        safety_profile=safety_profile,
+        maneuver_profile=maneuver_profile,
     )
 
 
@@ -301,6 +554,7 @@ def _load_compatible_policy(
     *,
     require_live: bool,
     require_offline: bool = True,
+    allow_unity_test_only: bool = False,
 ) -> RecurrentDiscreteSAC:
     """Hash-check one v10 policy at its requested promotion level."""
 
@@ -309,21 +563,70 @@ def _load_compatible_policy(
     if not checkpoint.is_file() or not manifest_path.is_file():
         raise FileNotFoundError("SAC checkpoint or manifest is missing")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != (
-        "national-test-sac-checkpoint-v4"
-    ):
+    schema_version = manifest.get("schema_version")
+    if schema_version not in SUPPORTED_CHECKPOINT_SCHEMAS:
         raise ValueError("SAC checkpoint manifest schema is incompatible")
+    safety_profile = runtime_safety_profile_from_manifest(manifest)
+    if safety_profile.unity_test_only and not allow_unity_test_only:
+        raise ValueError("runtime safety profile is restricted to unity_test")
+    maneuver_profile = runtime_maneuver_profile_from_manifest(manifest)
+    if maneuver_profile.unity_test_only and not allow_unity_test_only:
+        raise ValueError("runtime maneuver profile is restricted to unity_test")
+    if maneuver_profile != context.maneuver_profile:
+        raise ValueError("SAC checkpoint maneuver profile is incompatible")
+    v5_live_evidence_ready = True
+    if schema_version == V5_CHECKPOINT_SCHEMA and require_live:
+        evidence = manifest.get("evaluation_evidence")
+        decision = manifest.get("promotion_decision")
+        offline = evidence.get("offline") if isinstance(evidence, dict) else None
+        unity = evidence.get("unity") if isinstance(evidence, dict) else None
+        v5_live_evidence_ready = (
+            isinstance(offline, dict)
+            and offline.get("attempted") == 20
+            and offline.get("completed") == 20
+            and all(
+                offline.get(name) == 0
+                for name in (
+                    "collisions",
+                    "laser_stops",
+                    "safety_stops",
+                    "timeouts",
+                    "unrecovered_unsafe_events",
+                )
+            )
+            and isinstance(unity, dict)
+            and unity.get("attempted") == 5
+            and unity.get("completed") == 5
+            and all(
+                unity.get(name) == 0
+                for name in (
+                    "collisions",
+                    "laser_stops",
+                    "safety_stops",
+                    "timeouts",
+                    "unrecovered_unsafe_events",
+                )
+            )
+            and isinstance(decision, dict)
+            and decision.get("promote") is True
+        )
     if (
         (require_offline and manifest.get("offline_ready") is not True)
         or (
             require_live
             and (
                 manifest.get("live_ready") is not True
-                or not isinstance(
-                    manifest.get("unity_validation_log_hashes"),
-                    list,
+                or not v5_live_evidence_ready
+                or (
+                    schema_version == V4_CHECKPOINT_SCHEMA
+                    and (
+                        not isinstance(
+                            manifest.get("unity_validation_log_hashes"),
+                            list,
+                        )
+                        or len(manifest["unity_validation_log_hashes"]) < 3
+                    )
                 )
-                or len(manifest["unity_validation_log_hashes"]) < 3
             )
         )
     ):
@@ -373,7 +676,11 @@ def _load_compatible_policy(
         "route_guidance_version": ROUTE_GUIDANCE_VERSION,
         "route_guidance_hash": fixed_route_guidance_hash(compiled),
         "geometry_version": compiled.snapshot.geometry_version,
-        "policy_gate_version": MINIMUM_INTERVENTION_GATE_VERSION,
+        "policy_gate_version": (
+            SAFE_MASK_POLICY_GATE_VERSION
+            if schema_version == V5_CHECKPOINT_SCHEMA
+            else MINIMUM_INTERVENTION_GATE_VERSION
+        ),
         "prediction_horizon_policy_version": (
             PREDICTION_HORIZON_POLICY_VERSION
         ),
@@ -409,6 +716,9 @@ def _load_compatible_policy(
     policy.forward_control_profile = profile
     policy.reverse_control_profile = reverse_profile
     policy.reduced_dynamics = reduced_dynamics
+    policy.full_safe_action_authority = (
+        schema_version == V5_CHECKPOINT_SCHEMA
+    )
     return policy
 
 
@@ -449,6 +759,7 @@ def load_tested_candidate_policy(
         context,
         require_live=False,
         require_offline=False,
+        allow_unity_test_only=True,
     )
 
 
@@ -570,9 +881,25 @@ class FixedMapControllerCore:
         policy: RecurrentDiscreteSAC,
         *,
         dynamics: Optional[PrototypeReducedDynamics] = None,
+        deterministic_policy: bool = True,
+        full_safe_action_authority: Optional[bool] = None,
     ) -> None:
         self.context = context
         self.policy = policy
+        if type(deterministic_policy) is not bool:
+            raise ValueError("deterministic_policy must be boolean")
+        self.deterministic_policy = deterministic_policy
+        authority = (
+            getattr(policy, "full_safe_action_authority", False)
+            if full_safe_action_authority is None
+            else full_safe_action_authority
+        )
+        if type(authority) is not bool:
+            raise ValueError("full_safe_action_authority must be boolean")
+        self.full_safe_action_authority = authority
+        self.laser_emergency_distance_m = (
+            context.safety_profile.laser_emergency_distance_m
+        )
         self.dynamics = (
             dynamics
             or getattr(policy, "reduced_dynamics", None)
@@ -771,7 +1098,7 @@ class FixedMapControllerCore:
         )
         if (
             not valid_ranges
-            or min(valid_ranges) <= LASER_EMERGENCY_DISTANCE_M
+            or min(valid_ranges) <= self.laser_emergency_distance_m
             or abs(state.speed) > CLEARANCE_RECOVERY_MAX_SPEED_MPS
         ):
             return None
@@ -923,7 +1250,7 @@ class FixedMapControllerCore:
                 return recovery
             return self._stop("MAP_INVALID", state)
         if any(
-            valid and value <= LASER_EMERGENCY_DISTANCE_M
+            valid and value <= self.laser_emergency_distance_m
             for value, valid in zip(
                 sample.laser_ranges,
                 sample.laser_valid_mask,
@@ -961,6 +1288,16 @@ class FixedMapControllerCore:
                         self.context.compiled_map,
                         start_state=state,
                         dynamics=self.dynamics,
+                        turn_control=(
+                            self.context.maneuver_profile.turn_control
+                        ),
+                        turn_max_edges=(
+                            self.context.maneuver_profile.turn_max_edges
+                        ),
+                        turn_entry_speed_limit_mps=(
+                            self.context.maneuver_profile
+                            .turn_entry_speed_limit_mps
+                        ),
                     )
                     if self.maneuver_phase == "CLEARANCE_TURN_PENDING"
                     else plan_fixed_leg(
@@ -969,6 +1306,14 @@ class FixedMapControllerCore:
                         mission_index=planning_index,
                         dynamics=self.dynamics,
                         forward_action_controls=self.planning_controls,
+                        clearance_approach_throttle_cap=(
+                            self.context.maneuver_profile
+                            .approach_throttle_cap
+                        ),
+                        clearance_approach_rudder_cap=(
+                            self.context.maneuver_profile
+                            .approach_rudder_cap
+                        ),
                         narrow_visit_completed=(
                             self.maneuver_phase == "ESCAPE_PENDING"
                         ),
@@ -1221,17 +1566,50 @@ class FixedMapControllerCore:
                 tuple(nominal_future_controls),
             )
         )
-        candidates = (
-            tuple(
+        if (
+            self.full_safe_action_authority
+            and not reverse_nominal
+            and not ingress_recovery
+            and deterministic_special
+        ):
+            if deterministic_clearance:
+                controls = bounded_safe_action_controls(
+                    nominal,
+                    throttle_cap=(
+                        self.context.maneuver_profile.approach_throttle_cap
+                    ),
+                    rudder_cap=(
+                        self.context.maneuver_profile.approach_rudder_cap
+                    ),
+                )
+            elif deterministic_clearance_turn:
+                controls = bounded_safe_action_controls(
+                    nominal,
+                    throttle_cap=self.context.maneuver_profile.turn_throttle,
+                    rudder_cap=abs(self.context.maneuver_profile.turn_rudder),
+                )
+            else:
+                controls = tuple(
+                    candidate.control
+                    for candidate in self.generator.generate(
+                        nominal.throttle,
+                        nominal.rudder,
+                    )
+                )
+            candidates = tuple(
+                CandidateControl(action=index, control=control)
+                for index, control in enumerate(controls)
+            )
+        elif reverse_nominal or ingress_recovery or deterministic_special:
+            candidates = tuple(
                 CandidateControl(action=index, control=nominal)
                 for index in range(5)
             )
-            if reverse_nominal or ingress_recovery or deterministic_special
-            else self.generator.generate(
+        else:
+            candidates = self.generator.generate(
                 nominal.throttle,
                 nominal.rudder,
             )
-        )
         if reverse_nominal and not ingress_recovery:
             (
                 safe_mask,
@@ -1282,7 +1660,27 @@ class FixedMapControllerCore:
             )
         if not any(safe_mask):
             return self._stop("NO_SAFE_ACTION", state)
-        if deterministic_narrow_ingress:
+        observation = None
+        if self.full_safe_action_authority:
+            observation = build_fixed_map_observation(
+                state=state,
+                preview=preview,
+                safe_mask=safe_mask,
+                session_id=self.context.compiled_map.snapshot.session_id,
+                laser_ranges=sample.laser_ranges,
+                laser_valid_mask=sample.laser_valid_mask,
+                scan_age_s=sample.scan_age_s,
+                pose_age_s=sample.pose_age_s,
+                hidden_reset=self.hidden_reset,
+            )
+            proposal, next_hidden = self.policy.act(
+                observation,
+                safe_mask,
+                hidden=self.hidden,
+                deterministic=self.deterministic_policy,
+            )
+            policy_action = proposal.action
+        elif deterministic_narrow_ingress:
             policy_action = minimum_intervention_action(
                 policy_action=2,
                 safe_action_mask=safe_mask,
@@ -1313,7 +1711,7 @@ class FixedMapControllerCore:
                 observation,
                 safe_mask,
                 hidden=self.hidden,
-                deterministic=True,
+                deterministic=self.deterministic_policy,
             )
             policy_action = minimum_intervention_action(
                 policy_action=proposal.action,
@@ -1342,7 +1740,7 @@ class FixedMapControllerCore:
         )
         if decision.stop or decision.final_action is None:
             return self._stop(decision.reason, state)
-        if (
+        if self.full_safe_action_authority or (
             not reverse_nominal
             and not ingress_recovery
             and not deterministic_special
@@ -1378,10 +1776,27 @@ class FixedMapControllerCore:
             completed=False,
             replanned=replanned,
             maneuver_phase=self.maneuver_phase,
+            training_trace=(
+                None
+                if observation is None
+                else RuntimeTrainingTrace(
+                    observation=observation,
+                    executed_action=decision.final_action,
+                    safe_action_mask=decision.candidate_mask,
+                    mission_index=self.mission_index,
+                    distance_to_goal_m=self._distance(state),
+                    cross_track_error_m=preview.cross_track_error_m,
+                    map_clearance_m=(
+                        self.context.compiled_map.snapshot.clearance_at(state)
+                    ),
+                )
+            ),
         )
 
 
 __all__ = [
+    "BASELINE_RUNTIME_MANEUVER_PROFILE",
+    "BASELINE_RUNTIME_SAFETY_PROFILE",
     "DEFAULT_CHECKPOINT",
     "DEFAULT_UNITY_TEST_CHECKPOINT",
     "FixedMapControllerCore",
@@ -1389,9 +1804,16 @@ __all__ = [
     "LiveRouteContext",
     "RuntimeDecision",
     "RuntimeInput",
+    "RuntimeTrainingTrace",
+    "RuntimeManeuverProfile",
+    "RuntimeSafetyProfile",
     "approved_fixed_route_fallback",
     "build_live_route_context",
     "load_live_ready_policy",
     "load_offline_ready_policy",
+    "load_runtime_maneuver_profile",
+    "load_runtime_safety_profile",
     "load_tested_candidate_policy",
+    "runtime_maneuver_profile_from_manifest",
+    "runtime_safety_profile_from_manifest",
 ]

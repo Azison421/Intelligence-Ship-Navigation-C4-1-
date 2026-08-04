@@ -272,8 +272,46 @@ class SequenceReplay:
             if (transition.terminated or transition.timeout or transition.safety_truncation) and index != len(episode) - 1:
                 raise ValueError("terminal or safety boundary must be the last transition")
         self._episodes.append(episode)
+        self._next_episode_id += 1
         if len(self._episodes) > self.capacity:
             self._episodes.pop(0)
+
+    def state_dict(self) -> dict[str, object]:
+        """Return the complete replay state needed for an exact resume."""
+        return {
+            "capacity": self.capacity,
+            "rng_state": deepcopy(self._rng.getstate()),
+            "episodes": deepcopy(tuple(self._episodes)),
+            "next_episode_id": self._next_episode_id,
+            "observation_dim": self.observation_dim,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, object]) -> "SequenceReplay":
+        if not isinstance(state, dict):
+            raise ValueError("replay state must be a dictionary")
+        capacity = state.get("capacity")
+        if not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("replay capacity is invalid")
+        episodes = state.get("episodes")
+        if not isinstance(episodes, (list, tuple)) or len(episodes) > capacity:
+            raise ValueError("replay episodes are invalid")
+        replay = cls(capacity=capacity)
+        for episode in episodes:
+            if not isinstance(episode, (list, tuple)):
+                raise ValueError("replay episode is invalid")
+            replay.add_episode(episode)
+        next_episode_id = state.get("next_episode_id")
+        if not isinstance(next_episode_id, int) or next_episode_id < len(episodes):
+            raise ValueError("replay episode counter is invalid")
+        replay._next_episode_id = next_episode_id
+        if replay.observation_dim != state.get("observation_dim"):
+            raise ValueError("replay observation dimension is invalid")
+        try:
+            replay._rng.setstate(state["rng_state"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("replay random state is invalid") from exc
+        return replay
 
     def sample(self, batch_size: int, burn_in: int, unroll: int) -> ReplaySequenceBatch:
         if not self._episodes:
@@ -808,6 +846,49 @@ class RecurrentDiscreteSAC:
             "training_step": self.training_step,
         }
 
+    def training_state_dict(self) -> dict[str, object]:
+        """Return a defensive copy of all state required for exact continuation."""
+        _finite_modules(
+            (self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2),
+            "parameters",
+        )
+        _finite_tensor(self.log_alpha.detach(), "log_alpha")
+        self._finite_optimizer_states()
+        return self._snapshot_training_state()
+
+    def load_training_state_dict(self, state: dict[str, object]) -> None:
+        """Restore a complete training state without leaving partial mutations."""
+        required = {
+            "actor",
+            "critic1",
+            "critic2",
+            "target_critic1",
+            "target_critic2",
+            "actor_optimizer",
+            "critic1_optimizer",
+            "critic2_optimizer",
+            "alpha_optimizer",
+            "log_alpha",
+            "training_step",
+        }
+        if not isinstance(state, dict) or set(state) != required:
+            raise ValueError("training state is incomplete")
+        if type(state["training_step"]) is not int or state["training_step"] < 0:
+            raise ValueError("training state step is invalid")
+        _finite_value_tree(state, "training state")
+        before_load = self._snapshot_training_state()
+        try:
+            self._restore_training_state(deepcopy(state))
+            _finite_modules(
+                (self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2),
+                "parameters",
+            )
+            _finite_tensor(self.log_alpha.detach(), "log_alpha")
+            self._finite_optimizer_states()
+        except Exception:
+            self._restore_training_state(before_load)
+            raise
+
     def _restore_training_state(self, state: dict[str, object]) -> None:
         self.actor.load_state_dict(state["actor"])
         self.critic1.load_state_dict(state["critic1"])
@@ -852,17 +933,7 @@ class RecurrentDiscreteSAC:
             "observation_dim": self.observation_dim,
             "action_dim": self.action_dim,
             "hidden_dim": self.hidden_dim,
-            "actor": self.actor.state_dict(),
-            "critic1": self.critic1.state_dict(),
-            "critic2": self.critic2.state_dict(),
-            "target_critic1": self.target_critic1.state_dict(),
-            "target_critic2": self.target_critic2.state_dict(),
-            "actor_optimizer": self.actor_optimizer.state_dict(),
-            "critic1_optimizer": self.critic1_optimizer.state_dict(),
-            "critic2_optimizer": self.critic2_optimizer.state_dict(),
-            "log_alpha": self.log_alpha.detach().clone(),
-            "alpha_optimizer": self.alpha_optimizer.state_dict(),
-            "training_step": self.training_step,
+            **self.training_state_dict(),
         }
         with target.open("xb") as handle:
             torch.save(payload, handle)

@@ -354,6 +354,89 @@ def test_point_four_composite_keeps_clearance_after_point_three_east_gate():
     assert trajectory.min_clearance >= 0.4
 
 
+def test_points_three_to_five_conservative_profile_limits_controls_and_speed():
+    """The Unity experiment must use its smallest feasible 3 -> 4 -> 5 controls."""
+
+    compiled = compile_offline_national_map(
+        session_id="point-four-slow-unity-profile",
+        required_clearance_m=0.0,
+    )
+    profile = ForwardControlProfile(
+        calibration_hash="0" * 64,
+        minimum_steerage_throttle=0.1,
+        cruise_throttle=0.4,
+        action_controls=(
+            Control(0.1, -0.5),
+            Control(0.4, -0.2),
+            Control(0.4, 0.0),
+            Control(0.4, 0.2),
+            Control(0.4, 0.5),
+        ),
+        throttle_speed_gain=1.2681317113395243,
+        positive_rudder_yaw_rate_gain=1.962635624471142,
+        negative_rudder_yaw_rate_gain=2.048615259634089,
+    )
+    dynamics = reduced_dynamics_from_profile(profile)
+    approach = plan_fixed_leg(
+        compiled,
+        start_state=VesselState(
+            x=39.99182511134593,
+            y=77.3913731240417,
+            yaw=1.2087803047104109,
+            speed=0.12681330183438116,
+            yaw_rate=0.007204442569118387,
+            stamp_sim=65.5,
+        ),
+        mission_index=CLEARANCE_COMPOSITE_ROUTE_INDEX,
+        dynamics=dynamics,
+        forward_action_controls=profile.action_controls,
+        clearance_approach_throttle_cap=0.1,
+        clearance_approach_rudder_cap=0.1,
+        seed=31,
+    )
+    point_four_index = next(
+        index
+        for index, state in enumerate(approach.states)
+        if fixed_route_waypoint_reached(
+            compiled,
+            CLEARANCE_COMPOSITE_ROUTE_INDEX,
+            state,
+        )
+    )
+
+    assert max(control.throttle for control in approach.controls) <= 0.1
+    assert max(abs(control.rudder) for control in approach.controls) <= 0.1
+    assert approach.states[point_four_index].speed <= 0.15
+    assert approach.states[-1].speed <= 0.15
+    assert approach.min_clearance > 0.3
+
+    turn = plan_clearance_turn(
+        compiled,
+        start_state=approach.states[-1],
+        dynamics=dynamics,
+        turn_control=Control(0.1, 0.12),
+        turn_max_edges=180,
+        turn_entry_speed_limit_mps=0.15,
+    )
+    point_five_index = next(
+        index
+        for index, state in enumerate(turn.states)
+        if fixed_route_waypoint_reached(compiled, 4, state)
+    )
+
+    assert max(
+        control.throttle
+        for control in turn.controls[:point_five_index]
+    ) <= 0.1
+    assert max(
+        state.speed for state in turn.states[: point_five_index + 1]
+    ) <= 0.15
+    assert min(
+        compiled.snapshot.clearance_at(state)
+        for state in turn.states[: point_five_index + 1]
+    ) > 0.35
+
+
 def test_point_four_replan_preserves_completed_approach_progress():
     compiled = compile_offline_national_map(
         session_id="point-four-progress-replan",
@@ -545,7 +628,16 @@ def test_clearance_turn_reaches_point_five_with_continuous_safety():
 
     assert trajectory.validation_status == "VALID"
     assert trajectory.times[-1] <= 30.0
-    assert trajectory.min_clearance > 0.3
+    point_five_index = next(
+        index
+        for index, state in enumerate(trajectory.states)
+        if fixed_route_waypoint_reached(compiled, 4, state)
+    )
+    assert min(
+        compiled.snapshot.clearance_at(state)
+        for state in trajectory.states[: point_five_index + 1]
+    ) > 0.3
+    assert trajectory.min_clearance > compiled.snapshot.required_clearance
     assert fixed_route_waypoint_reached(
         compiled,
         4,

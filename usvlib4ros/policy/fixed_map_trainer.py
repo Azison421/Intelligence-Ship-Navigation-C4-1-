@@ -92,6 +92,11 @@ from .safety_supervisor import (
     PredictiveSafetySupervisor,
     minimum_intervention_action,
 )
+from .self_training import (
+    SelfTrainingOperationalProfile,
+    bounded_safe_action_controls,
+    fixed_map_reward,
+)
 
 
 LASER_COUNT = 72
@@ -99,6 +104,10 @@ OFFLINE_LASER_RANGE_M = 20.0
 LIVE_RESET_SPAWN_X_M = 40.418016575586535
 LIVE_RESET_SPAWN_Y_M = 63.725363742991874
 LIVE_RESET_SPAWN_YAW_RAD = 1.778354580040184
+
+
+class EpisodeInterrupted(RuntimeError):
+    """Operator stopped before an offline episode reached a terminal boundary."""
 
 
 @dataclass(frozen=True)
@@ -271,12 +280,36 @@ class FixedMapSACTrainer:
         reverse_calibration_status: str = "diagnostic_only",
         seed: int = 31,
         hidden_dim: int = 32,
+        operational_profile: Optional[SelfTrainingOperationalProfile] = None,
+        full_safe_action_authority: bool = False,
     ) -> None:
         self.seed = int(seed)
         self.rng = random.Random(self.seed)
+        self.operational_profile = operational_profile or SelfTrainingOperationalProfile(
+            required_clearance_m=0.2,
+            laser_emergency_distance_m=0.6,
+            point3_to_4_throttle_cap=0.4,
+            point3_to_4_rudder_cap=1.0,
+            point4_to_5_throttle_cap=0.4,
+            point4_to_5_rudder_cap=0.2,
+            turn_max_edges=80,
+            turn_entry_speed_limit_mps=0.15,
+        )
+        if type(full_safe_action_authority) is not bool:
+            raise ValueError("full_safe_action_authority must be boolean")
+        self.full_safe_action_authority = full_safe_action_authority
         self.compiled_map = compiled_map or compile_offline_national_map(
             session_id=f"fixed-map-training-{self.seed}",
+            required_clearance_m=(
+                self.operational_profile.required_clearance_m
+            ),
         )
+        if not math.isclose(
+            self.compiled_map.snapshot.required_clearance,
+            self.operational_profile.required_clearance_m,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("compiled map clearance and training profile differ")
         self.forward_profile = (
             forward_profile or diagnostic_forward_control_profile()
         )
@@ -340,6 +373,12 @@ class FixedMapSACTrainer:
             dynamics=self.dynamics,
             seed=self.seed,
             forward_action_controls=self.planning_controls,
+            clearance_approach_throttle_cap=(
+                self.operational_profile.point3_to_4_throttle_cap
+            ),
+            clearance_approach_rudder_cap=(
+                self.operational_profile.point3_to_4_rudder_cap
+            ),
         )
         preview = self._preview(initial, trajectory, 0)
         candidates, safe_mask, _, _, _, _ = self._safe_candidates(
@@ -362,6 +401,10 @@ class FixedMapSACTrainer:
             seed=self.seed,
             observation_schema=observation.schema_version,
         )
+        self.sac.forward_control_profile = self.forward_profile
+        self.sac.reverse_control_profile = self.reverse_profile
+        self.sac.reduced_dynamics = self.dynamics
+        self.sac.full_safe_action_authority = self.full_safe_action_authority
         self.replay = SequenceReplay(capacity=256, seed=self.seed)
 
     @property
@@ -486,10 +529,44 @@ class FixedMapSACTrainer:
                 for index in range(5)
             )
         elif force_nominal:
-            candidates = tuple(
-                CandidateControl(action=index, control=nominal_control)
-                for index in range(5)
-            )
+            if self.full_safe_action_authority:
+                if is_clearance_composite_trajectory(trajectory):
+                    controls = bounded_safe_action_controls(
+                        nominal_control,
+                        throttle_cap=(
+                            self.operational_profile.point3_to_4_throttle_cap
+                        ),
+                        rudder_cap=(
+                            self.operational_profile.point3_to_4_rudder_cap
+                        ),
+                    )
+                elif is_clearance_turn_trajectory(trajectory):
+                    controls = bounded_safe_action_controls(
+                        nominal_control,
+                        throttle_cap=(
+                            self.operational_profile.point4_to_5_throttle_cap
+                        ),
+                        rudder_cap=(
+                            self.operational_profile.point4_to_5_rudder_cap
+                        ),
+                    )
+                else:
+                    controls = tuple(
+                        candidate.control
+                        for candidate in self.generator.generate(
+                            max(0.0, nominal_control.throttle),
+                            nominal_control.rudder,
+                        )
+                    )
+                candidates = tuple(
+                    CandidateControl(action=index, control=control)
+                    for index, control in enumerate(controls)
+                )
+            else:
+                candidates = tuple(
+                    CandidateControl(action=index, control=nominal_control)
+                    for index in range(5)
+                )
         else:
             feedback_control = feedback_tracking_control(
                 preview,
@@ -698,7 +775,8 @@ class FixedMapSACTrainer:
         episode: int,
         nominal_action_probability: float,
         deterministic_policy: bool = False,
-        max_steps: int = 3_000,
+        max_steps: int = 5_000,
+        should_stop=None,
     ) -> tuple[tuple[SequenceTransition, ...], EpisodeSummary]:
         if not 0.0 <= nominal_action_probability <= 1.0:
             raise ValueError("nominal_action_probability must be in [0, 1]")
@@ -713,6 +791,12 @@ class FixedMapSACTrainer:
             dynamics=self.dynamics,
             seed=self.seed + episode,
             forward_action_controls=self.planning_controls,
+            clearance_approach_throttle_cap=(
+                self.operational_profile.point3_to_4_throttle_cap
+            ),
+            clearance_approach_rudder_cap=(
+                self.operational_profile.point3_to_4_rudder_cap
+            ),
         )
         trajectory_index = 0
         maneuver_phase = "NORMAL"
@@ -743,6 +827,8 @@ class FixedMapSACTrainer:
         narrow_escape_release_step: int | None = None
 
         for step in range(max_steps):
+            if should_stop is not None and should_stop():
+                raise EpisodeInterrupted("offline episode interrupted by operator")
             if (
                 mission_index == CLEARANCE_COMPOSITE_ROUTE_INDEX
                 and maneuver_phase == "NORMAL"
@@ -805,6 +891,11 @@ class FixedMapSACTrainer:
                         self.compiled_map,
                         start_state=state,
                         dynamics=self.dynamics,
+                        turn_control=self.operational_profile.turn_control,
+                        turn_max_edges=self.operational_profile.turn_max_edges,
+                        turn_entry_speed_limit_mps=(
+                            self.operational_profile.turn_entry_speed_limit_mps
+                        ),
                     )
                     if maneuver_phase == "CLEARANCE_TURN_PENDING"
                     else plan_fixed_leg(
@@ -820,6 +911,12 @@ class FixedMapSACTrainer:
                             clearance_approach_completed
                         ),
                         forward_action_controls=self.planning_controls,
+                        clearance_approach_throttle_cap=(
+                            self.operational_profile.point3_to_4_throttle_cap
+                        ),
+                        clearance_approach_rudder_cap=(
+                            self.operational_profile.point3_to_4_rudder_cap
+                        ),
                     )
                 )
                 preview = self._preview(state, trajectory, 0)
@@ -912,7 +1009,15 @@ class FixedMapSACTrainer:
                 )
                 break
 
-            if deterministic_narrow_ingress:
+            if self.full_safe_action_authority:
+                proposal, hidden = self.sac.act(
+                    observation,
+                    safe_mask,
+                    hidden=hidden,
+                    deterministic=deterministic_policy,
+                )
+                policy_action = proposal.action
+            elif deterministic_narrow_ingress:
                 policy_action = minimum_intervention_action(
                     policy_action=2,
                     safe_action_mask=safe_mask,
@@ -1089,6 +1194,14 @@ class FixedMapSACTrainer:
                             self.compiled_map,
                             start_state=next_state,
                             dynamics=self.dynamics,
+                            turn_control=self.operational_profile.turn_control,
+                            turn_max_edges=(
+                                self.operational_profile.turn_max_edges
+                            ),
+                            turn_entry_speed_limit_mps=(
+                                self.operational_profile
+                                .turn_entry_speed_limit_mps
+                            ),
                         )
                         if maneuver_phase == "CLEARANCE_TURN_PENDING"
                         else plan_fixed_leg(
@@ -1103,6 +1216,13 @@ class FixedMapSACTrainer:
                                 clearance_approach_completed
                             ),
                             forward_action_controls=self.planning_controls,
+                            clearance_approach_throttle_cap=(
+                                self.operational_profile
+                                .point3_to_4_throttle_cap
+                            ),
+                            clearance_approach_rudder_cap=(
+                                self.operational_profile.point3_to_4_rudder_cap
+                            ),
                         )
                     )
                     trajectory_index = 0
@@ -1183,13 +1303,13 @@ class FixedMapSACTrainer:
                 and not transition.needs_new_plan
                 else 0.5
             )
-            reward = (
-                2.0 * progress_reward
-                - 0.1 * next_preview.cross_track_error_m
-                - 0.03 * abs(decision.final_action - 2)
-                + 0.02 * min(minimum_clearance, 2.0)
-                + (5.0 if transition.task_point_advanced else 0.0)
-                + (20.0 if terminated else 0.0)
+            reward = fixed_map_reward(
+                progress_m=progress_reward,
+                cross_track_error_m=next_preview.cross_track_error_m,
+                executed_action=decision.final_action,
+                minimum_clearance_m=minimum_clearance,
+                task_point_advanced=transition.task_point_advanced,
+                terminated=terminated,
             )
             transitions.append(
                 SequenceTransition(
@@ -1318,7 +1438,7 @@ class FixedMapSACTrainer:
         self,
         *,
         episodes: int = 1,
-        max_steps: int = 3_000,
+        max_steps: int = 5_000,
     ) -> tuple[EvaluationSummary, tuple[EpisodeSummary, ...]]:
         if episodes <= 0:
             raise ValueError("evaluation episodes must be positive")
@@ -1463,6 +1583,7 @@ class FixedMapSACTrainer:
 
 
 __all__ = [
+    "EpisodeInterrupted",
     "EpisodeSummary",
     "EvaluationSummary",
     "FixedMapSACTrainer",

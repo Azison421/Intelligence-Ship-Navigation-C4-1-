@@ -19,15 +19,40 @@ from usvlib4ros.policy.fixed_map_trainer import (
     advance_training_maneuver,
 )
 from usvlib4ros.policy.fixed_map_features import TrajectoryPreview
+from usvlib4ros.policy.self_training import (
+    operational_profile_from_manifest,
+)
 
 
 def test_offline_evaluation_uses_competition_step_limit():
-    assert (
-        inspect.signature(FixedMapSACTrainer.evaluate)
-        .parameters["max_steps"]
-        .default
-        == 3_000
+    for method in (
+        FixedMapSACTrainer.run_episode,
+        FixedMapSACTrainer.evaluate,
+    ):
+        assert (
+            inspect.signature(method).parameters["max_steps"].default
+            == 5_000
+        )
+
+
+def test_self_training_profile_builds_zero_clearance_offline_map_and_enables_safe_mask_authority():
+    manifest_path = (
+        __import__("pathlib").Path("artifacts/checkpoints")
+        / "national_test_sac_v37_zero_clearance_conservative_345_unity_test.pt.json"
     )
+    profile = operational_profile_from_manifest(
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+    )
+
+    trainer = FixedMapSACTrainer(
+        operational_profile=profile,
+        full_safe_action_authority=True,
+        seed=131,
+    )
+
+    assert trainer.compiled_map.snapshot.required_clearance == 0.0
+    assert trainer.operational_profile == profile
+    assert trainer.full_safe_action_authority is True
 
 
 def _forward_profile():

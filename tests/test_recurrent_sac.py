@@ -93,6 +93,35 @@ def test_sequence_replay_keeps_episode_boundaries_and_padding_masks():
     assert all(first == second for first, second in zip(batch.episode_ids, batch.episode_ids))
 
 
+def test_training_state_round_trip_restores_network_optimizers_temperature_and_step():
+    observation = _observation()
+    agent = RecurrentDiscreteSAC(observation_dim=observation.feature_dim, hidden_dim=16, seed=101)
+    replay = SequenceReplay(capacity=4, seed=101)
+    replay.add_episode([_transition(index) for index in range(3)])
+    state = agent.training_state_dict()
+    before_actor = {name: value.clone() for name, value in agent.actor.state_dict().items()}
+
+    agent.update(replay.sample(batch_size=1, burn_in=0, unroll=2))
+    assert agent.training_step == 1
+    assert any(
+        not torch.equal(value, before_actor[name])
+        for name, value in agent.actor.state_dict().items()
+    )
+
+    agent.load_training_state_dict(state)
+    assert agent.training_step == 0
+    assert all(
+        torch.equal(value, before_actor[name])
+        for name, value in agent.actor.state_dict().items()
+    )
+
+    bad = agent.training_state_dict()
+    bad["log_alpha"] = torch.tensor(float("nan"))
+    with pytest.raises(ValueError, match="finite"):
+        agent.load_training_state_dict(bad)
+    assert agent.training_step == 0
+
+
 def test_recurrent_next_state_advance_uses_hidden_after_each_current_observation():
     torch.manual_seed(47)
     observation_dim = 6

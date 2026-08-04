@@ -12,6 +12,7 @@ from typing import Iterable
 
 MANIFEST_SCHEMA = "national-test-sac-checkpoint-v4"
 UNITY_LOG_SCHEMA = "national-test-unity-validation-v1"
+MAX_UNITY_EPISODE_SECONDS = 600.0
 
 
 class PolicyMode(str, Enum):
@@ -69,7 +70,9 @@ def promote_checkpoint(
             evidence.get("passed") is not True
             or not isinstance(evidence.get("duration_s"), (int, float))
             or not isfinite(float(evidence["duration_s"]))
-            or not 0.0 <= float(evidence["duration_s"]) <= 300.0
+            or not 0.0 <= float(evidence["duration_s"]) <= (
+                MAX_UNITY_EPISODE_SECONDS
+            )
             or evidence.get("completed_waypoints") != 13
             or not isinstance(distances, list)
             or len(distances) != 13
@@ -105,4 +108,10 @@ def promote_checkpoint(
     return promoted
 
 
-__all__ = ["MANIFEST_SCHEMA", "PolicyMode", "UNITY_LOG_SCHEMA", "promote_checkpoint"]
+__all__ = [
+    "MANIFEST_SCHEMA",
+    "MAX_UNITY_EPISODE_SECONDS",
+    "PolicyMode",
+    "UNITY_LOG_SCHEMA",
+    "promote_checkpoint",
+]

@@ -33,19 +33,32 @@ python usvlib4ros/main.py
   [--config PATH]
   [--policy-mode {live,offline_validation,unity_test}]
   [--checkpoint PATH]
+  [--validate-only]
 ```
 
-CLI 无参数运行默认选择 `unity_test` 和当前 v37 候选，供用户点击 Train 开展 Unity
-复测。该候选只完成聚焦离线回放，尚未完成正式晋级。显式 `live` 仍只接受
-`offline_ready=true`、`live_ready=true` 且 Unity 证据充分的 checkpoint；程序化
-`USVNavMain.start(host, port, deviceId)` 的默认模式也仍为 `live`。
+CLI 无参数运行默认选择 `unity_test`，并在用户点击 Train 后启动可中断、可续训的
+混合自训练。它优先使用 `national_test_sac_active.json` 指向的已晋级冠军；首次没有
+活动指针时从 `national_test_sac_v37_zero_clearance_conservative_345_unity_test.pt`
+热启动。该种子复用旧 v37 的同一份权重，manifest 继续绑定 0 m／0 m，并把
+第 3→4 段限制为 `油门≤0.1、|舵角|≤0.1`，第 4→5 点转弯设为
+`Control(0.1, 0.12)`；0.4 m 船体外形和预测碰撞仍保留。旧 v37、上一版零净空及
+上一版慢转显式路径继续使用各自原局部控制。种子仅允许 `unity_test`，
+`offline_ready`、`live_ready` 均为 false；只有满足 20/20 离线和 5/5 Unity 双门槛
+并通过冠军比较的 v5 才会原子切换活动指针。显式 checkpoint、显式模式或
+`--validate-only` 不启动梯度更新。程序化 `USVNavMain.start(host, port, deviceId)`
+的默认模式仍为 `live`，`self_training` 默认仍为 false。
 
-程序在连接前执行资产 preflight；正式任务按单回合运行，13 点完成后保持零控制；
-退出时请求停止、发布零控制、等待导航线程并终止 ROS 连接。
+程序在连接前执行资产 preflight；单回合默认最多 5000 个控制步或 600 s，13 点完成
+后保持零控制；退出时请求停止、发布零控制、等待导航线程并终止 ROS 连接。
+`PLANNING_DEFERRED` 会发布零控制并在同一回合继续重试，不再按连续次数结束回合；
+既有 600 s 墙钟超时、碰撞和停止请求仍保持原来的结束行为。
 
-每次 Train 按钮触发会分配独立 `run_id`；episode 结束后在项目 `reports/` 中累计
-写入 3 份 CSV，并重绘总步长、逐目标累计步长和分段步长 3 张 SVG。报告写入失败
-只记录错误，不会改变安全控制或样例 UI 协议。
+每次 Train 按钮触发仍写旧 3 份 CSV 和 3 张步长 SVG。无参数自训练另外写入
+`self_training_episodes.csv`、`self_training_generations.csv` 以及 reward、累计成功率、
+总步数和 actor/critic loss 4 张 SVG，并在每个完整回合后原子保存续训状态。
+SVG 坐标轴按实际数据自动缩放，5000 不是图表硬上限。UI 字段继续复用原协议：
+`E/Step/Score/Loss/MaxE` 分别表示累计训练回合、当前步、累计 reward、最新 critic
+loss 和当前累计目标。
 
 不存在旧文档曾列出的 `--host`、`--device-id`、`enable_debug` 或各类 debug
 frequency 参数。

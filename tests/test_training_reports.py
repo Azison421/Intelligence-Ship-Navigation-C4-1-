@@ -10,6 +10,9 @@ from usvlib4ros.navigation.fixed_map_service import (
 )
 from usvlib4ros.navigation.training_reports import (
     EpisodeReport,
+    SelfTrainingEpisodeReport,
+    SelfTrainingGenerationReport,
+    SelfTrainingReportLogger,
     TrainingReportLogger,
 )
 
@@ -133,6 +136,46 @@ def test_report_logger_rejects_non_monotonic_waypoint_steps(tmp_path):
         )
 
 
+def test_report_logger_records_5000_steps_with_automatic_svg_scale(tmp_path):
+    logger = TrainingReportLogger(
+        tmp_path,
+        run_id="run-5000",
+        source="unity_train_button",
+        started_at="2026-08-04T12:00:00Z",
+    )
+    logger.record_episode(
+        _episode(
+            episode=0,
+            total_steps=5_000,
+            reached_steps=(
+                300,
+                600,
+                900,
+                1_200,
+                1_500,
+                1_800,
+                2_100,
+                2_400,
+                2_700,
+                3_000,
+                3_300,
+                3_600,
+                5_000,
+            ),
+            completed=True,
+        )
+    )
+
+    episodes = _csv_rows(tmp_path / "training_episodes.csv")
+    svg = (tmp_path / "training_total_steps.svg").read_text(
+        encoding="utf-8"
+    )
+
+    assert episodes[0]["total_steps"] == "5000"
+    assert episodes[0]["total_steps_to_goal"] == "5000"
+    assert ">10000</text>" in svg
+
+
 def test_train_button_episode_is_written_to_reports(tmp_path, monkeypatch):
     class _StopService(Exception):
         pass
@@ -206,3 +249,66 @@ def test_train_button_episode_is_written_to_reports(tmp_path, monkeypatch):
     assert episodes[0]["episode"] == "0"
     assert episodes[0]["total_steps_to_goal"] == "130"
     assert (tmp_path / "waypoint_cumulative_steps.svg").is_file()
+
+
+def test_self_training_reports_append_across_clicks_and_render_all_requested_curves(tmp_path):
+    first = SelfTrainingReportLogger(tmp_path)
+    first.record_episode(
+        SelfTrainingEpisodeReport(
+            session_id="session-a",
+            generation=1,
+            stage="offline_train",
+            episode=1,
+            total_steps=5000,
+            total_reward=-12.5,
+            completed=False,
+            actor_loss=0.4,
+            critic_loss=1.2,
+            training_step=16,
+        )
+    )
+    second = SelfTrainingReportLogger(tmp_path)
+    second.record_episode(
+        SelfTrainingEpisodeReport(
+            session_id="session-a",
+            generation=1,
+            stage="unity_train",
+            episode=2,
+            total_steps=900,
+            total_reward=38.0,
+            completed=True,
+            actor_loss=0.2,
+            critic_loss=0.7,
+            training_step=16,
+        )
+    )
+    second.record_generation(
+        SelfTrainingGenerationReport(
+            session_id="session-a",
+            generation=1,
+            completed_training_episodes=100,
+            parent_sha256="a" * 64,
+            candidate_sha256="b" * 64,
+            promoted=True,
+            promotion_reason="UNITY_MEDIAN_STEPS_IMPROVED",
+            offline_completed=20,
+            unity_completed=5,
+            unity_median_steps=900.0,
+        )
+    )
+
+    episodes = _csv_rows(tmp_path / "self_training_episodes.csv")
+    generations = _csv_rows(tmp_path / "self_training_generations.csv")
+    assert [row["global_episode"] for row in episodes] == ["1", "2"]
+    assert [row["stage"] for row in episodes] == ["offline_train", "unity_train"]
+    assert episodes[0]["total_steps"] == "5000"
+    assert generations[0]["promoted"] == "1"
+    for name in (
+        "self_training_reward.svg",
+        "self_training_success_rate.svg",
+        "self_training_total_steps.svg",
+        "self_training_losses.svg",
+    ):
+        path = tmp_path / name
+        assert path.is_file()
+        assert ElementTree.parse(path).getroot().tag.endswith("svg")

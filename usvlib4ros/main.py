@@ -1,8 +1,8 @@
 """Official Maritime Intelligent Navigation 2026 C4 entrypoint.
 
-The no-argument sample entry loads the current focused-offline-replay
-candidate in :attr:`PolicyMode.UNITY_TEST` so an operator can run Unity
-validation.
+The no-argument sample entry starts resumable hybrid self-training from the
+active champion, or from the restricted zero-clearance conservative 3-4-5
+candidate when no promoted champion exists.
 Explicit :attr:`PolicyMode.LIVE` still requires full offline and Unity
 promotion before a checkpoint is loaded.
 
@@ -10,6 +10,7 @@ CLI:
     --config PATH       path to config.json (default: <repo>/config.json)
     --policy-mode MODE  live | offline_validation | unity_test
     --checkpoint PATH   override the default SAC checkpoint path
+    --validate-only     deterministic validation without gradient updates
 """
 
 from __future__ import annotations
@@ -83,7 +84,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the default SAC checkpoint path",
     )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="run deterministic validation only; never apply gradient updates",
+    )
     return parser
+
+
+def self_training_requested(argv: list[str], args: argparse.Namespace) -> bool:
+    """Only the unpinned default workflow may start gradient updates."""
+    explicit_policy_mode = any(
+        token == "--policy-mode" or token.startswith("--policy-mode=")
+        for token in argv
+    )
+    return (
+        not bool(args.validate_only)
+        and args.checkpoint is None
+        and not explicit_policy_mode
+    )
 
 
 def resolve_checkpoint_path(
@@ -100,8 +119,13 @@ def resolve_checkpoint_path(
     )
 
     if policy_mode == PolicyMode.UNITY_TEST:
-        return DEFAULT_UNITY_TEST_CHECKPOINT
-    return DEFAULT_CHECKPOINT
+        fallback = DEFAULT_UNITY_TEST_CHECKPOINT
+    else:
+        fallback = DEFAULT_CHECKPOINT
+    from usvlib4ros.policy.self_training import ActiveCheckpointRegistry
+
+    active_path = DEFAULT_CHECKPOINT.parent / "national_test_sac_active.json"
+    return ActiveCheckpointRegistry(active_path).resolve(fallback)
 
 
 def preflight_assets(checkpoint_path: Optional[Path] = None) -> None:
@@ -126,6 +150,8 @@ class USVNavMain:
         *,
         policy_mode: PolicyMode = PolicyMode.LIVE,
         checkpoint_path: Optional[Path] = None,
+        self_training: bool = False,
+        validate_only: bool = False,
     ):
         # Heavy ROS-facing imports are deferred so that the module stays
         # importable (and testable) without a ROS bridge installation.
@@ -145,13 +171,16 @@ class USVNavMain:
             globalData,
             policy_mode=policy_mode,
             checkpoint_path=checkpoint_path,
+            self_training=self_training,
+            validate_only=validate_only,
         )
         nav.startService()
         return nav
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
     policy_mode = PolicyMode(args.policy_mode)
     checkpoint_path = resolve_checkpoint_path(
         policy_mode,
@@ -168,6 +197,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         ros2_cfg["deviceId"],
         policy_mode=policy_mode,
         checkpoint_path=checkpoint_path,
+        self_training=self_training_requested(raw_argv, args),
+        validate_only=args.validate_only,
     )
     print(
         f"policy_mode={policy_mode.value} "

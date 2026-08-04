@@ -4,12 +4,14 @@
 `DQN_NAV` 包装器以及 Unity 的 Reset／自动模式／路线／Train 触发流程，内部实现为
 固定 `National_Test` 地图的 13 点导航。
 
-> 2026-08-04 状态：13/13 的纯离线闭环用例已经通过；第 11 点入口已改为
-> 不依赖 SAC 的确定性闭环轨迹跟踪，进入目标后再按原路倒车并绕障退出。
-> 本次修改没有运行 Unity、ROS 或 MATLAB，也没有执行全量 pytest。
-> 当前默认 checkpoint 仍是旧路线契约且 `offline_ready=false`、
-> `live_ready=false`，因此正式 `live` 模式会按设计拒绝启动，不能把离线结果
-> 表述为比赛环境已通过。
+> 2026-08-04 状态：无参数 CLI 已接入可中断、可续训的 SAC 混合自训练，以当前
+> v37 零净空保守候选为初始冠军。每代执行 95 个离线训练回合、5 个 Unity 安全探索
+> 回合、20 个离线评估回合和 5 个 Unity 确定性验收回合；首次训练前另做 5 个原始
+> 冠军 Unity 基线回合。零净空、点 3→4 的 `0.1/±0.1` 硬上限、点 4→5 的
+> `0.1/0.12` 硬上限、0.4 m 船体和预测安全否决权均保留。
+> 自训练闭环已通过聚焦纯 Python 测试，但本次没有启动 Unity、ROS 或 MATLAB，也没有
+> 运行全量 pytest；因此尚无 v5 晋级模型，初始 v37 候选仍为
+> `offline_ready=false`、`live_ready=false`。
 
 ## 地图与任务约定
 
@@ -20,6 +22,9 @@
 - 内部局部坐标为 `x=东`、`y=北`。
 - 只有船体中心进入原始目标点的 0.5 m 圆域才切换下一点；规划辅助门不能替代
   正式目标。
+- 旧 v37 基线的地图额外净空／激光提前急停阈值分别为 0.2 m／0.6 m；当前零净空
+  Unity 实验分别为 0 m／0 m。船体外形、13 点顺序和主算法不变；当前默认候选只在
+  点 3 后至点 5 的局部复合机动中使用低速 profile。
 
 比赛参考资料：
 
@@ -52,8 +57,8 @@ grid/lattice seed 或连接轨迹上早停，以控制固定地图在线延迟�
 | 点位 | 控制策略 | 目的 |
 |---|---|---|
 | 1–3、7–10 | 动力学规划 + SAC + 安全动作掩码 | 普通航段跟踪和避障 |
-| 4 | 确定性进点复合轨迹，持续到西侧安全交接门 | 避免进点后过早切换导致贴障 |
-| 5 | 西侧交接门到第 5 点的固定转弯 | 保持连续可执行转向 |
+| 4 | 确定性进点复合轨迹；当前候选从点 3 后把正向油门和舵角绝对值都限制为 0.1，持续到西侧安全交接门 | 低速、小舵角通过目标并避免过早切换贴障 |
+| 5 | 西侧交接门以 `0.1` 油门、`0.12` 舵角固定转弯进入 | 使用离线可到达点 5 的最小已验证舵角，缩小外飘 |
 | 6 | 局部动力学 primitive 搜索 | 穿过贴近浮标的有效目标区域并退出 |
 | 11 | 确定性闭环入口 + 入点后反向退出 | 防止开环误差在窄区累积；入口不调用 SAC |
 | 12 | 第 11 点后的确定性南侧绕障交接 | 先脱离窄区，再进入后续目标 |
@@ -106,6 +111,7 @@ CLI 只支持：
 --config PATH
 --policy-mode {live,offline_validation,unity_test}
 --checkpoint PATH
+--validate-only
 ```
 
 不存在 `--host`、`--device-id` 或旧 README 中的调试频率参数；连接值来自
@@ -117,11 +123,17 @@ CLI 只支持：
 |---|---|---|
 | `live` | `offline_ready=true`、`live_ready=true`，且具备足够 Unity 证据 | 正式比赛入口 |
 | `offline_validation` | `offline_ready=true` | 离线验收工具 |
-| `unity_test`（CLI 默认） | 可加载未晋级候选，但仍校验文件与算法契约 | Unity 候选测试 |
+| `unity_test`（CLI 默认模式） | 可加载未晋级候选，但仍校验文件与算法契约 | 无参数时混合自训练；显式模式时确定性候选测试 |
 
-直接运行 `python usvlib4ros\main.py` 会选择当前 v37 候选用于 Unity 复测；该候选仅
-完成聚焦离线回放，manifest 仍为 `offline_ready=false`、`live_ready=false`。正式运行
-命令应在 v37 checkpoint 完成晋级后再使用：
+直接运行 `python usvlib4ros\main.py` 会选择当前活动冠军；首次没有活动指针时从
+`national_test_sac_v37_zero_clearance_conservative_345_unity_test.pt` 热启动，并在
+Unity 点击“开始训练”后进入混合自训练。该种子与旧
+`national_test_sac_v37_unity_test.pt`、上一版零净空候选及上一版慢转候选的权重
+字节和 SHA-256 完全相同，但由独立 manifest 绑定 0 m／0 m 安全参数，以及点 3→4
+的 `0.1/±0.1` 包络和第 4→5 点 `Control(0.1, 0.12)`。三个旧路径仍使用各自原
+配置。显式 `--checkpoint PATH`、显式 `--policy-mode` 或 `--validate-only` 都只做
+确定性运行，不执行梯度更新；显式路径不会跟随活动冠军。四份 v37 候选的 readiness
+都仍为 false。正式运行命令只能在兼容 checkpoint 完成自动或人工晋级后使用：
 
 ```powershell
 .\.venv\Scripts\python.exe usvlib4ros\main.py `
@@ -136,9 +148,12 @@ CLI 只支持：
 nav = USVNavMain.start(host, port, deviceId)
 ```
 
-前三个位置参数及 UI 触发顺序保持兼容；新增的运行模式与 checkpoint 是仅限关键字
-的可选参数。正式模式默认单回合：完成 13 点后持续发布零控制，不再自动 Reset
-下一回合。`Ctrl+C`／`SIGTERM` 会请求停止、发布零控制、等待导航线程并关闭连接。
+前三个位置参数及 UI 触发顺序保持兼容；新增的运行模式、checkpoint、自训练和
+只验收标志都是仅限关键字的可选参数。单回合默认上限为 5000 个控制步、墙钟上限
+为 600 s；旧 `MAX_EPOCH` 保持不变，自训练 UI 的 `MaxE` 显示当前累计目标。
+`PLANNING_DEFERRED` 会在当前周期发布零控制并保留回合，下一周期继续尝试规划；不会
+再因为连续出现 3 次而结束回合。既有 600 s 墙钟超时、碰撞和停止请求仍可结束回合。
+`Ctrl+C`／`SIGTERM` 会请求停止、发布零控制、等待导航线程并关闭连接。
 
 ## 训练日志
 
@@ -152,44 +167,55 @@ nav = USVNavMain.start(host, port, deviceId)
 - `waypoint_cumulative_steps.svg`：13 个目标点累计步长曲线；
 - `waypoint_segment_steps.svg`：13 个航段步长曲线。
 
-历史 CSV 不会因再次启动程序而清空；SVG 会在追加 episode 后用全部历史数据重绘。
+无参数自训练还会追加：
+
+- `self_training_episodes.csv`：阶段、代次、reward、成功、步数、loss 和训练步；
+- `self_training_generations.csv`：父／候选哈希、20/20 与 5/5 结果和晋级原因；
+- `self_training_reward.svg`、`self_training_success_rate.svg`、
+  `self_training_total_steps.svg`、`self_training_losses.svg`；
+- `self_training_state/`：每个完整回合后的原子续训状态；半回合不会写入。
+
+历史 CSV 不会因再次启动程序而清空；SVG 会在追加 episode 后用全部历史数据重绘，
+坐标轴按实际数据自动缩放，5000 不是硬编码的图表上限。
 未抵达目标点使用空值和曲线断点，不写成 0。图形为白底灰黑线、实线／虚线／点线
 的论文风格，并且不依赖 Matplotlib。字段定义见
 [`reports/README.md`](./reports/README.md)。
 
-这里的 UI“训练”是 Unity 闭环运行，不会在线更新 SAC 权重；真正的离线 SAC 训练
-仍由 `tools/train_fixed_map_sac.py` 执行，两者的步数含义不能混合。
+无参数入口中的 UI“训练”现在会更新 SAC：每个离线训练回合做 16 次更新，5 个
+Unity 探索回合后做 80 次 6:2 混合更新。UI 的 `E` 是累计训练回合，`Step` 是
+当前回合步数，`Score` 是累计 reward，`Loss` 是最新 critic loss，`MaxE` 是当前
+累计目标。显式 checkpoint、显式模式或 `--validate-only` 仍是确定性运行且不更新。
 
 ## 离线验证边界
 
-本次只使用点名用例，未执行 `pytest` 全量回归：
+原 v37 基线的 13/13 证据继续保留，但零净空和第 3→4→5 点保守增量只使用点名用例，
+未重新运行 13/13 回放，也未执行 `pytest` 全量回归。自训练闭环的状态机、回放、
+权重更新、晋级和日志证据见
+[`reports/self_training.tdd.md`](./reports/self_training.tdd.md)。零净空／5000 步证据见
+[`reports/zero_clearance_5000_steps.tdd.md`](./reports/zero_clearance_5000_steps.tdd.md)，
+本次局部机动证据见
+[`reports/points3_to5_conservative_reset.tdd.md`](./reports/points3_to5_conservative_reset.tdd.md)；
+上一版慢转证据仍保留在
+[`reports/point4_point5_slow_turn.tdd.md`](./reports/point4_point5_slow_turn.tdd.md)。
+覆盖重点为：
 
-```powershell
-# 13 个目标依次进入、点 11 退出后到点 12、最终完成且全程安全
-.\.venv\Scripts\python.exe -m pytest -q `
-  tests/test_fixed_map_trainer.py::test_fixed_map_sac_trains_complete_safe_episode_and_saves_checkpoint
+- 旧／新安全 profile、地图与路线 hash；
+- 0–0.2 m 额外净空区间、船体接触和激光接触；
+- 新旧候选加载门禁、5000 步／600 s；
+- CSV 的 5000 步记录和 SVG 自动缩放。
+- 点 3→4 的油门／舵角上限、点 4→5 最小可行转弯、规划延迟零控制重试、旧候选回退与新候选门禁。
 
-# 点 11 闭环入口不调用 SAC；点 11 倒车出口不调用 SAC
-.\.venv\Scripts\python.exe -m pytest -q `
-  tests/test_fixed_map_runtime.py::test_runtime_executes_closed_loop_narrow_ingress_without_calling_sac `
-  tests/test_fixed_map_runtime.py::test_runtime_executes_safe_reverse_escape_without_calling_sac
-
-# 样例入口和界面契约
-.\.venv\Scripts\python.exe -m pytest -q tests/test_sample_entry_compatibility.py
-
-# Train 点击后的 CSV/SVG 日志
-.\.venv\Scripts\python.exe -m pytest -q tests/test_training_reports.py
-```
-
-离线通过只证明当前简化动力学、静态 sidecar 和测试初始条件下可完成 13/13；它不
-证明 Unity 中的实际船模、ROS 时序、传感器延迟或 Simulink 联调已经通过。
+原 v37 基线的离线通过只证明该基线在简化动力学、静态 sidecar 和测试初始条件下
+可完成 13/13；它不证明新零净空配置或 Unity 中的实际船模、ROS 时序、传感器延迟、
+Simulink 联调已经通过。
 
 ## 当前已知限制
 
-- CLI 无参数入口选择已完成 13/13 聚焦离线回放的 v37 Unity 候选；它尚未晋级，
-  因此显式 `live` 继续失败关闭是预期行为。
-- 现有历史 Unity 候选日志含碰撞，且发生在本次修复之前；需要用户按相同 13 点
-  地图重新测试，不能沿用旧日志给当前代码背书。
+- CLI 无参数入口会从未晋级的零净空保守 3→4→5 候选启动自训练；训练编排仅通过
+  聚焦离线契约测试，尚无真实 Unity 自训练结果或 v5 晋级模型。显式 `live` 在没有
+  活动冠军时失败关闭是预期行为。
+- 用户截图显示旧候选在第 4→5 点存在碰撞，并出现持续规划延迟；当前保守 profile
+  与规划延迟重试是针对这些现象的未验证修复，需要用户在相同 13 点地图重新测试。
 - `setup.py` 未声明运行依赖和地图 package data；当前只支持从源码目录运行，wheel
   交付尚未完成。
 - `usvlib4ros（1）` 是仓库中的旧副本，未删除；正式入口只使用 `usvlib4ros/`。

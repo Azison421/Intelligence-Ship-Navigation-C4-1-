@@ -1,6 +1,11 @@
+import inspect
+import json
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from usvlib4ros.navigation.fixed_map_runtime import (
     RuntimeDecision,
@@ -126,7 +131,7 @@ def test_collision_requires_direct_dual_evidence_or_five_seconds_of_laser():
     assert confirmed
 
 
-def test_official_main_entry_defaults_to_v37_unity_test_candidate():
+def test_official_main_entry_defaults_to_v37_conservative_345_candidate():
     from usvlib4ros import main as entry
 
     args = entry.build_parser().parse_args([])
@@ -134,13 +139,36 @@ def test_official_main_entry_defaults_to_v37_unity_test_candidate():
     assert args.policy_mode == PolicyMode.UNITY_TEST.value
     assert args.config is None
     assert args.checkpoint is None
+    assert args.validate_only is False
+    assert entry.self_training_requested([], args) is True
     assert (
         entry.resolve_checkpoint_path(
             PolicyMode(args.policy_mode),
             args.checkpoint,
         ).name
-        == "national_test_sac_v37_unity_test.pt"
+        == "national_test_sac_v37_zero_clearance_conservative_345_unity_test.pt"
     )
+
+
+def test_explicit_checkpoint_live_or_validate_only_never_starts_gradient_updates():
+    from usvlib4ros import main as entry
+
+    for argv in (
+        ["--checkpoint", "candidate.pt"],
+        ["--policy-mode", "live"],
+        ["--policy-mode=unity_test"],
+        ["--validate-only"],
+    ):
+        args = entry.build_parser().parse_args(argv)
+        assert entry.self_training_requested(argv, args) is False
+
+    with pytest.raises(ValueError, match="restricted to unity_test"):
+        FixedMapNavigationService(
+            object(),
+            _OutputCapture(),
+            policy_mode=PolicyMode.LIVE,
+            self_training=True,
+        )
 
 
 def test_official_main_entry_keeps_live_checkpoint_for_explicit_live_mode():
@@ -187,6 +215,160 @@ def test_policy_loader_maps_explicit_modes_to_fail_closed_loaders():
         policy_loader_for_mode(PolicyMode.UNITY_TEST)
         is load_tested_candidate_policy
     )
+
+
+def test_unity_episode_uses_5000_step_and_600_second_limits(
+    monkeypatch,
+    tmp_path,
+):
+    from usvlib4ros.navigation import fixed_map_service as service_module
+
+    assert service_module.MAX_EPOCH == 4_000
+    assert service_module.MAX_STEPS == 5_000
+    assert (
+        inspect.signature(FixedMapNavigationService._run_episode)
+        .parameters["max_seconds"]
+        .default
+        == 600.0
+    )
+
+    checkpoint = tmp_path / "candidate.pt"
+    checkpoint.write_bytes(b"candidate")
+    checkpoint.with_suffix(".pt.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "national-test-sac-checkpoint-v4",
+                "offline_ready": False,
+                "live_ready": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = _OutputCapture()
+    output.device_data = SimpleNamespace(task_status=1)
+    service = FixedMapNavigationService(
+        SimpleNamespace(),
+        output,
+        checkpoint_path=checkpoint,
+        policy_mode=PolicyMode.UNITY_TEST,
+    )
+    vessel_state = SimpleNamespace(
+        x=0.0,
+        y=0.0,
+        yaw=0.0,
+        speed=0.0,
+        yaw_rate=0.0,
+    )
+    sample = SimpleNamespace(
+        vessel_state=vessel_state,
+        laser_ranges=(20.0,) * 72,
+        laser_valid_mask=(False,) * 72,
+    )
+    snapshot = SimpleNamespace(clearance_at=lambda _state: 1.0)
+    manifest = SimpleNamespace(
+        origin_enu=(0.0, 0.0),
+        route_points_enu=tuple((float(index), 0.0) for index in range(13)),
+    )
+    context = SimpleNamespace(
+        compiled_map=SimpleNamespace(snapshot=snapshot, manifest=manifest)
+    )
+
+    class _Adapter:
+        def __init__(self, *_args):
+            pass
+
+        def build(self):
+            return sample
+
+    class _Core:
+        mission_index = 0
+        deferred_before_completion = 0
+
+        def __init__(self, *_args):
+            self.calls = 0
+
+        def step(self, _sample):
+            self.calls += 1
+            deferred = self.calls <= self.deferred_before_completion
+            completed = (
+                self.deferred_before_completion > 0 and not deferred
+            )
+            reason = (
+                "PLANNING_DEFERRED"
+                if deferred
+                else "MISSION_DONE"
+                if completed
+                else "POLICY_ACTION_SAFE"
+            )
+            return RuntimeDecision(
+                reason=reason,
+                control=(
+                    None
+                    if deferred
+                    else Control(0.0, 0.0)
+                ),
+                action=None if deferred else 2,
+                mission_index=0,
+                distance_to_goal_m=1.0,
+                advised_heading_deg=0.0,
+                safe_mask=(True,) * 5,
+                completed=completed,
+                replanned=False,
+            )
+
+    monkeypatch.setattr(service, "_wait_for_pose", lambda: object())
+    monkeypatch.setattr(service, "_task_status_active", lambda: True)
+    monkeypatch.setattr(service, "_publish_decision", lambda *_a, **_k: None)
+    monkeypatch.setattr(service, "_publish_zero", lambda **_k: None)
+    monkeypatch.setattr(
+        service_module,
+        "build_live_route_context",
+        lambda *_a, **_k: context,
+    )
+    monkeypatch.setattr(service_module, "LiveInputAdapter", _Adapter)
+    monkeypatch.setattr(service_module, "FixedMapControllerCore", _Core)
+    monkeypatch.setattr(
+        service_module,
+        "policy_loader_for_mode",
+        lambda _mode: (lambda *_a, **_k: object()),
+    )
+    monkeypatch.setattr(service_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(service_module.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr("builtins.print", lambda *_a, **_k: None)
+
+    assert not service._run_episode(object(), 0)
+    assert service.last_episode_metrics["total_steps"] == 5_000
+    assert service.last_episode_metrics["stop_reason"] == "POLICY_ACTION_SAFE"
+
+    _Core.deferred_before_completion = 3
+    assert service._run_episode(object(), 1)
+    assert service.last_episode_metrics["total_steps"] == 4
+    assert service.last_episode_metrics["stop_reason"] == "MISSION_DONE"
+
+    _Core.deferred_before_completion = 0
+    clock = iter((0.0, 601.0, 601.0))
+    monkeypatch.setattr(service_module.time, "monotonic", lambda: next(clock))
+    assert not service._run_episode(object(), 2)
+    assert service.last_episode_metrics["total_steps"] == 0
+    assert service.last_episode_metrics["stop_reason"] == "TIMEOUT"
+    assert service.last_episode_metrics["duration_s"] == 601.0
+
+
+def test_bounded_episode_tools_use_600_second_limit(monkeypatch):
+    from tools import run_candidate_live_episode as candidate_tool
+    from tools import run_one_live_episode as live_tool
+
+    assert candidate_tool.MAX_EPISODE_SECONDS == 600.0
+    assert live_tool.MAX_EPISODE_SECONDS == 600.0
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_candidate_live_episode.py", "candidate.pt"],
+    )
+    assert candidate_tool._arguments().max_seconds == 600.0
+    monkeypatch.setattr(sys, "argv", ["run_one_live_episode.py"])
+    assert live_tool._arguments().max_seconds == 600.0
 
 
 def test_dqn_nav_defaults_to_live_policy_mode_and_starts_thread():

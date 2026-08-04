@@ -35,6 +35,8 @@ class DQN_NAV:
         policy_mode: PolicyMode = PolicyMode.LIVE,
         checkpoint_path: Optional[Path] = None,
         single_episode: bool = True,
+        self_training: bool = False,
+        validate_only: bool = False,
     ):
         del xyzAxis
         self.ros_ctrl = ros_ctrl
@@ -55,6 +57,8 @@ class DQN_NAV:
             policy_mode=self.policy_mode,
             checkpoint_path=checkpoint_path,
             single_episode=single_episode,
+            self_training=self_training,
+            validate_only=validate_only,
         )
 
     def startService(self):

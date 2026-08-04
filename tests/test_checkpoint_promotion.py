@@ -31,7 +31,7 @@ def test_promotion_requires_three_matching_passed_unity_validation_logs(tmp_path
                     "map_payload_hash": "map-hash",
                     "calibration_hash": "calibration-hash",
                     "passed": True,
-                    "duration_s": 299.0,
+                    "duration_s": 599.0,
                     "completed_waypoints": 13,
                     "waypoint_min_distances_m": [0.5] * 13,
                     "collisions": 0,
@@ -49,4 +49,3 @@ def test_promotion_requires_three_matching_passed_unity_validation_logs(tmp_path
     assert promoted["live_ready"] is True
     assert len(promoted["unity_validation_log_hashes"]) == 3
     assert json.loads(manifest_path.read_text(encoding="utf-8")) == promoted
-

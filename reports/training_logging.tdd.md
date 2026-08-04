@@ -1,5 +1,9 @@
 # Train 按钮 CSV/SVG 日志 TDD 证据
 
+> 历史说明：本文冻结最初“Train 仅运行闭环 episode”的旧日志接入证据。无参数
+> 入口现已接入实际 SAC 混合自训练，并在不改变本文 3 份 CSV／3 张 SVG 的基础上
+> 新增自训练 CSV／SVG；当前契约见 [`self_training.tdd.md`](./self_training.tdd.md)。
+
 日期：2026-08-04  
 来源：根据本轮用户需求直接形成，没有外部计划文件。
 
@@ -52,7 +56,7 @@ tests/test_training_reports.py + tests/test_sample_entry_compatibility.py
 - 严格没有运行全量 pytest。
 - 没有启动 Unity、ROS 或 MATLAB；UI 接入由隔离服务测试验证，真实点击结果仍需
   用户下一次 Unity 运行产生。
-- 当前 UI“训练”是闭环 episode，不会在线更新 SAC 参数；日志步长不能解释为梯度
-  更新次数。
+- 本文测试时 UI“训练”尚未在线更新 SAC；该陈述仅为历史状态。当前无参数入口会
+  更新 SAC，显式 checkpoint、显式模式和 `--validate-only` 才保持确定性无梯度。
 - 工作树在本轮开始前已有其他未提交修改，因此没有创建 TDD checkpoint commit；
   RED/GREEN 证据保存在本文件中。
