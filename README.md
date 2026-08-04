@@ -1,271 +1,202 @@
-# usvlib4ros2 运行指南
+# 海航赛 2026 C4 固定地图导航
 
-> 本文档面向测试人员，说明如何运行 `main.py` 连接仿真平台
+本仓库保留比赛样例的 `main.py`、`USVNavMain.start(host, port, deviceId)`、
+`DQN_NAV` 包装器以及 Unity 的 Reset／自动模式／路线／Train 触发流程，内部实现为
+固定 `National_Test` 地图的 13 点导航。
 
-> **National_Test 算法状态（2026-08-02）**：入口和三端协议保持样例不变。
-> 规划地图使用 0.2 米水域栅格和 sidecar 精确圆形浮标；运行时仅在船体
-> 中心进入原始目标 0.5 米圆域后切点。第 11 个目标采用不可拆分的
-> “东侧前进穿点—沿入口倒车退出—安全东侧释放”复合机动，其余航段保持
-> Kinodynamic Informed RRT* 全局规划和五动作 SAC 局部决策。候选 v10
-> 已完成 20/20 离线随机初始姿态评估：13/13、零安全截断、零超时，
-> 全部逐点最小距离不超过 0.5 米；但在三次 Unity 闭环全部通过前仍保持
-> `offline_ready=true`、`live_ready=false`，默认 `main.py` 不会加载它。
+> 2026-08-04 状态：13/13 的纯离线闭环用例已经通过；第 11 点入口已改为
+> 不依赖 SAC 的确定性闭环轨迹跟踪，进入目标后再按原路倒车并绕障退出。
+> 本次修改没有运行 Unity、ROS 或 MATLAB，也没有执行全量 pytest。
+> 当前默认 checkpoint 仍是旧路线契约且 `offline_ready=false`、
+> `live_ready=false`，因此正式 `live` 模式会按设计拒绝启动，不能把离线结果
+> 表述为比赛环境已通过。
 
----
+## 地图与任务约定
 
-## 一、环境要求
+- Unity 图片中黄色圆点是 13 个必须按序到达的目标点。
+- 白色线条是目标点连接关系，不等同于可直接跟踪的无碰撞轨迹。
+- 红白相间物体是静态障碍物。
+- 船从画面下方进入；画面上北、下南、左西、右东。
+- 内部局部坐标为 `x=东`、`y=北`。
+- 只有船体中心进入原始目标点的 0.5 m 圆域才切换下一点；规划辅助门不能替代
+  正式目标。
 
-### 1.1 软件环境
+比赛参考资料：
 
-| 组件 | 版本要求 | 说明 |
-|------|---------|------|
-| Python | 3.10+ | 建议使用 Anaconda/Miniconda 管理环境 |
-| roslibpy | 1.x | 连接 ROS2 的 Python 库 |
-| 其他依赖 | 见 `requirements.txt` | numpy, torch 等 |
+- [2026 海航赛智能导航主页](https://spaitlab.github.io/Maritime-Intelligent-Navigation-2026/)
+- [赛事资源](https://spaitlab.github.io/Maritime-Intelligent-Navigation-2026/%E8%B5%9B%E4%BA%8B%E8%B5%84%E6%BA%90/)
+- [操作手册](https://spaitlab.github.io/Maritime-Intelligent-Navigation-2026/%E6%93%8D%E4%BD%9C%E6%89%8B%E5%86%8C/)
+- [评分细则](https://spaitlab.github.io/Maritime-Intelligent-Navigation-2026/%E8%AF%84%E5%88%86%E7%BB%86%E5%88%99/)
 
-### 1.2 前置条件
+## 当前算法
 
-运行 `main.py` 前需确保以下环境已就绪：
+控制链为：
 
-1. **Ubuntu VM 已启动**并运行 ros2-image 容器
-2. **EmboUnity.exe 已启动**并进入场景
-3. **MATLAB Simulink 模型已点击运行**
-4. **ROSbridge 服务**监听端口 9090
-
-### 1.3 项目目录说明
-
-本文档使用 `{项目根目录}` 表示 usvlib4ros2 项目的位置，**请根据实际情况替换**。
-
-> **示例**：
-> - 您的项目目录：`D:\MyProject\usvlib4ros2`
-> - 配置文件：`{项目根目录}\usvlib4ros\main.py` → `D:\MyProject\usvlib4ros2\usvlib4ros\main.py`
-> - 依赖文件：`{项目根目录}\requirements.txt` → `D:\MyProject\usvlib4ros2\requirements.txt`
-
----
-
-## 二、快速开始
-
-### 2.1 安装依赖
-
-```bash
-# 进入项目根目录（请根据实际情况替换）
-cd {项目根目录}
-
-# 创建虚拟环境（推荐）
-conda create -n usvtest python=3.10
-conda activate usvtest
-
-# 安装依赖
-pip install -r requirements.txt
+```text
+固定地图与 13 点任务
+  -> Kinodynamic Informed RRT* 规划器实现
+  -> SAC 五动作局部决策／局部确定性机动
+  -> 预测安全监督器
+  -> 样例 ROS/Unity 控制接口
 ```
 
-> **提示**：如果项目目录包含中文或特殊字符，建议使用英文目录名。
+“Informed RRT* + SAC”需要准确理解：普通航段使用
+`KinodynamicInformedRRTStarPlanner` 与 SAC；运行时默认
+`optimize_with_rrtstar=False`，规划器在首条经过动力学和碰撞验证的
+grid/lattice seed 或连接轨迹上早停，以控制固定地图在线延迟。只有显式开启
+`optimize_with_rrtstar=True` 才会继续执行 informed sampling 与 rewiring。
+所以当前可运行配置不是“每段都用完整预算做 RRT* 最优化”。
 
-### 2.2 运行 main.py
+局部点位允许使用不同算法，当前分工如下：
 
-```bash
-# 方法1：直接运行（使用默认配置）
-python {项目根目录}/usvlib4ros/main.py
+| 点位 | 控制策略 | 目的 |
+|---|---|---|
+| 1–3、7–10 | 动力学规划 + SAC + 安全动作掩码 | 普通航段跟踪和避障 |
+| 4 | 确定性进点复合轨迹，持续到西侧安全交接门 | 避免进点后过早切换导致贴障 |
+| 5 | 西侧交接门到第 5 点的固定转弯 | 保持连续可执行转向 |
+| 6 | 局部动力学 primitive 搜索 | 穿过贴近浮标的有效目标区域并退出 |
+| 11 | 确定性闭环入口 + 入点后反向退出 | 防止开环误差在窄区累积；入口不调用 SAC |
+| 12 | 第 11 点后的确定性南侧绕障交接 | 先脱离窄区，再进入后续目标 |
+| 13 | 确定性终点接近轨迹 | 保证最终进入 0.5 m 目标圆并停车 |
 
-# 方法2：指定配置
-python {项目根目录}/usvlib4ros/main.py --host 192.168.213.132 --device-id ID_09e4063515d81b2f7352e15bdd53294ace675e96
+所有分支仍由预测安全监督器进行碰撞检查；没有安全动作时输出零控制并停止，
+而不是强行执行局部机动。
+
+路线指导契约是 `national-test-reversible-composite-v37`。本次版本升级用于阻止
+旧 checkpoint 与当前局部点位进出逻辑静默混用。
+
+## 环境与配置
+
+建议使用 Python 3.10+。依赖以 `requirements.txt` 为准：
+
+```powershell
+Set-Location '<项目根目录>'
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
----
+仓库根目录的 `config.json` 是连接参数唯一来源。不要把真实主机地址或设备 ID
+复制到日志、截图、报告或提交中。结构如下：
 
-## 三、配置说明
+```json
+{
+  "ros2": {
+    "host": "<ROSBRIDGE_HOST>",
+    "port": 9090,
+    "deviceId": "<UNITY_DEVICE_ID>"
+  }
+}
+```
 
-### 3.1 参数配置
+运行前还需要按比赛平台手册启动 Unity、ROSbridge 与 Simulink。程序会在建立
+外部连接前检查 checkpoint、manifest、静态地图和标定资产；缺失或契约不一致时
+直接失败。
 
-在 `main.py` 的 `USVNavMain.start()` 调用中修改参数：
+## 入口与运行模式
+
+查看当前真实参数：
+
+```powershell
+.\.venv\Scripts\python.exe usvlib4ros\main.py --help
+```
+
+CLI 只支持：
+
+```text
+--config PATH
+--policy-mode {live,offline_validation,unity_test}
+--checkpoint PATH
+```
+
+不存在 `--host`、`--device-id` 或旧 README 中的调试频率参数；连接值来自
+`config.json`。
+
+模式含义：
+
+| 模式 | checkpoint 门槛 | 用途 |
+|---|---|---|
+| `live` | `offline_ready=true`、`live_ready=true`，且具备足够 Unity 证据 | 正式比赛入口 |
+| `offline_validation` | `offline_ready=true` | 离线验收工具 |
+| `unity_test`（CLI 默认） | 可加载未晋级候选，但仍校验文件与算法契约 | Unity 候选测试 |
+
+直接运行 `python usvlib4ros\main.py` 会选择当前 v37 候选用于 Unity 复测；该候选仅
+完成聚焦离线回放，manifest 仍为 `offline_ready=false`、`live_ready=false`。正式运行
+命令应在 v37 checkpoint 完成晋级后再使用：
+
+```powershell
+.\.venv\Scripts\python.exe usvlib4ros\main.py `
+  --config .\config.json `
+  --policy-mode live `
+  --checkpoint .\artifacts\checkpoints\PROMOTED_V37_CHECKPOINT.pt
+```
+
+样例程序仍可调用：
 
 ```python
-USVNavMain.start(
-    host="192.168.213.132",      # 虚拟机IP地址
-    port=9090,                     # rosbridge端口（固定不变）
-    deviceId="ID_09e4063515d81b2f7352e15bdd53294ace675e96",  # 设备唯一标识
-    enable_debug=True,             # 是否启用调试输出
-    laser_debug_freq=0.5,          # 激光雷达打印频率（Hz）
-    device_debug_freq=1.0,         # 设备状态打印频率（Hz）
-    control_debug_freq=2.0         # 控制指令打印频率（Hz）
-)
+nav = USVNavMain.start(host, port, deviceId)
 ```
 
-### 3.2 参数说明
+前三个位置参数及 UI 触发顺序保持兼容；新增的运行模式与 checkpoint 是仅限关键字
+的可选参数。正式模式默认单回合：完成 13 点后持续发布零控制，不再自动 Reset
+下一回合。`Ctrl+C`／`SIGTERM` 会请求停止、发布零控制、等待导航线程并关闭连接。
 
-| 参数 | 说明 | 默认值 | 示例 |
-|------|------|--------|------|
-| `host` | Ubuntu 虚拟机 IP 地址 | 必须配置 | `"192.168.213.132"` |
-| `port` | rosbridge WebSocket 端口 | `9090` | `9090` |
-| `deviceId` | EmboUnity 中智能体的唯一标识 | 必须配置 | `"ID_09e4063515d81b2f7352e15bdd53294ace675e96"` |
-| `enable_debug` | 是否输出调试日志 | `True` | `True` / `False` |
-| `laser_debug_freq` | 激光雷达日志打印频率 | `0.5` Hz | `0.5` = 每2秒打印一次 |
-| `device_debug_freq` | 设备状态日志打印频率 | `1.0` Hz | `1.0` = 每秒打印一次 |
-| `control_debug_freq` | 控制指令日志打印频率 | `2.0` Hz | `2.0` = 每0.5秒打印一次 |
+## 训练日志
 
-### 3.3 如何获取配置值
+每次在 Unity 中点击“开始训练”，程序会创建新的 `run_id`。每个 episode 结束后，
+以下累计日志自动写入根目录 `reports/`：
 
-#### 获取虚拟机 IP
+- `training_runs.csv`：每次点击及其 episode／成功数；
+- `training_episodes.csv`：每回合总步长和到达终点所需总步长；
+- `waypoint_steps.csv`：13 个目标点的累计步长与相邻点分段步长；
+- `training_total_steps.svg`：各回合总步长曲线；
+- `waypoint_cumulative_steps.svg`：13 个目标点累计步长曲线；
+- `waypoint_segment_steps.svg`：13 个航段步长曲线。
 
-在 Ubuntu VM 终端执行：
+历史 CSV 不会因再次启动程序而清空；SVG 会在追加 episode 后用全部历史数据重绘。
+未抵达目标点使用空值和曲线断点，不写成 0。图形为白底灰黑线、实线／虚线／点线
+的论文风格，并且不依赖 Matplotlib。字段定义见
+[`reports/README.md`](./reports/README.md)。
 
-```bash
-hostname -I
+这里的 UI“训练”是 Unity 闭环运行，不会在线更新 SAC 权重；真正的离线 SAC 训练
+仍由 `tools/train_fixed_map_sac.py` 执行，两者的步数含义不能混合。
+
+## 离线验证边界
+
+本次只使用点名用例，未执行 `pytest` 全量回归：
+
+```powershell
+# 13 个目标依次进入、点 11 退出后到点 12、最终完成且全程安全
+.\.venv\Scripts\python.exe -m pytest -q `
+  tests/test_fixed_map_trainer.py::test_fixed_map_sac_trains_complete_safe_episode_and_saves_checkpoint
+
+# 点 11 闭环入口不调用 SAC；点 11 倒车出口不调用 SAC
+.\.venv\Scripts\python.exe -m pytest -q `
+  tests/test_fixed_map_runtime.py::test_runtime_executes_closed_loop_narrow_ingress_without_calling_sac `
+  tests/test_fixed_map_runtime.py::test_runtime_executes_safe_reverse_escape_without_calling_sac
+
+# 样例入口和界面契约
+.\.venv\Scripts\python.exe -m pytest -q tests/test_sample_entry_compatibility.py
+
+# Train 点击后的 CSV/SVG 日志
+.\.venv\Scripts\python.exe -m pytest -q tests/test_training_reports.py
 ```
 
-或
+离线通过只证明当前简化动力学、静态 sidecar 和测试初始条件下可完成 13/13；它不
+证明 Unity 中的实际船模、ROS 时序、传感器延迟或 Simulink 联调已经通过。
 
-```bash
-ip addr show
-```
+## 当前已知限制
 
-输出示例：`192.168.213.132`
+- CLI 无参数入口选择已完成 13/13 聚焦离线回放的 v37 Unity 候选；它尚未晋级，
+  因此显式 `live` 继续失败关闭是预期行为。
+- 现有历史 Unity 候选日志含碰撞，且发生在本次修复之前；需要用户按相同 13 点
+  地图重新测试，不能沿用旧日志给当前代码背书。
+- `setup.py` 未声明运行依赖和地图 package data；当前只支持从源码目录运行，wheel
+  交付尚未完成。
+- `usvlib4ros（1）` 是仓库中的旧副本，未删除；正式入口只使用 `usvlib4ros/`。
+- 传感器新鲜度仍部分依赖回调替换消息对象，若未来改成原地更新字段，需要改为
+  接收时间戳或序列号。
+- 当前范围是已知静态障碍的固定 National_Test 地图；动态障碍、随机地图和任意
+  点数任务不在本次实现范围。
 
-#### 获取 deviceId
-
-1. 启动 EmboUnity.exe
-2. 登录后选择智能体，deviceId 会显示在界面或配置文件中
-3. 示例值：`ID_09e4063515d81b2f7352e15bdd53294ace675e96`
-
----
-
-## 四、运行示例
-
-### 4.1 正常启动输出
-
-成功连接后，终端应显示：
-
-```
-[Main] USV Navigation Service started with debug logging enabled.
-[Main] Press Ctrl+C to stop.
-
-[ROS Debug] Connected to rosbridge at 192.168.213.132:9090
-[ROS DEBUG] [激光雷达数据] Topic: usv/ID_xxx/laser/scan, angle_min: -3.14 ...
-[ROS DEBUG] [设备状态] latitude: 30.xxxx, longitude: 120.xxxx, heading: 45.5°
-[ROS DEBUG] [控制指令] linear.x: 0.5, angular.z: 0.0
-```
-
-### 4.2 常见错误及处理
-
-| 错误信息 | 可能原因 | 解决方法 |
-|---------|---------|---------|
-| `Connection refused` | VM 未启动或 rosbridge 未运行 | 检查 VM 状态，确认 ros2-image 容器运行 |
-| `Timeout error` | 网络不通或防火墙拦截 | 检查宿主机与 VM 网络连接，关闭防火墙 |
-| `Invalid deviceId` | deviceId 与 EmboUnity 中不匹配 | 确认 deviceId 大小写正确 |
-| `No data received` | EmboUnity 未启动或未进入场景 | 确认 EmboUnity 已启动并选择智能体 |
-
----
-
-## 五、调试功能
-
-### 5.1 关闭调试输出
-
-如不需要频繁的日志输出，可关闭调试：
-
-```python
-USVNavMain.start(
-    host="192.168.213.132",
-    port=9090,
-    deviceId="ID_xxx",
-    enable_debug=False      # 关闭调试输出
-)
-```
-
-### 5.2 调整打印频率
-
-根据需要调整各话题的打印频率：
-
-```python
-# 高频率详细调试
-laser_debug_freq=2.0    # 每0.5秒打印一次激光雷达数据
-device_debug_freq=2.0    # 每0.5秒打印一次设备状态
-control_debug_freq=5.0  # 每0.2秒打印一次控制指令
-
-# 低频率减少输出
-laser_debug_freq=0.1     # 每10秒打印一次
-device_debug_freq=0.5    # 每2秒打印一次
-control_debug_freq=0.5   # 每2秒打印一次
-```
-
-### 5.3 查看实时统计数据
-
-按 `Ctrl+C` 停止服务后，会打印统计数据：
-
-```
-[Main] Stopping USV Navigation Service...
-[Debug Stats]
-  Total laser scans received: 1256
-  Total device status updates: 628
-  Total control commands sent: 2512
-```
-
----
-
-## 六、测试检查清单
-
-运行 `main.py` 后，按照以下清单验证功能：
-
-| 检查项 | 预期结果 | 实际结果 |
-|--------|---------|---------|
-| 1. 连接成功 | 显示 `[ROS Debug] Connected to rosbridge` | |
-| 2. 激光雷达数据 | 每2秒输出激光雷达日志 | |
-| 3. 设备状态数据 | 每秒输出经纬度、航向角、速度 | |
-| 4. 控制指令 | 每0.5秒输出控制指令日志 | |
-| 5. EmboUnity 联动 | Unity 场景中无人船响应控制 | |
-| 6. 正常停止 | Ctrl+C 后显示统计数据 | |
-
----
-
-## 七、常见问题
-
-### Q1: 出现 `ModuleNotFoundError: No module named 'usvlib4ros'`
-
-**原因**：未将项目目录加入 Python 路径
-
-**解决**：
-```bash
-# 在项目根目录执行（Windows PowerShell）
-$env:PYTHONPATH = "$env:PYTHONPATH;{项目根目录}\usvlib4ros"
-python {项目根目录}\usvlib4ros\main.py
-
-# 或在 Python 代码中临时添加
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'usvlib4ros'))
-```
-
-### Q2: 出现 `WebSocket connection failed`
-
-**原因**：rosbridge 未启动或端口错误
-
-**解决**：
-1. 确认 VM 中 ros2-image 容器运行：`docker ps | grep ros2-image`
-2. 确认 rosbridge 监听端口：`docker exec ros2-image ss -tlnp | grep 9090`
-3. 检查 host 参数是否正确
-
-### Q3: 数据一直为 0 或不变
-
-**原因**：EmboUnity 未正确启动或 MATLAB 未运行
-
-**解决**：
-1. 确认 EmboUnity 已进入场景并选择智能体
-2. 确认 MATLAB 中 Simulink 模型正在运行（状态为 Running）
-
-### Q4: 停止后程序不退出的处理
-
-有时 `Ctrl+C` 可能无法立即停止，可再次按 `Ctrl+C` 或关闭终端窗口
-
----
-
-## 八、联系支持
-
-如遇到本文档未覆盖的问题，请联系开发人员并提供：
-1. 完整的终端输出日志
-2. 项目根目录路径（{项目根目录}）
-3. VM IP 和 deviceId 配置
-4. 测试环境描述（哪个步骤出错）
-
----
-
-*文档版本：v1.0*
-*更新日期：2026-05-15*
+详细证据和逐点审查见
+[`海航赛智能船导航算法审查总结.md`](./海航赛智能船导航算法审查总结.md)。

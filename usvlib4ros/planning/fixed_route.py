@@ -42,9 +42,9 @@ MAX_FIXED_ROUTE_TOLERANCE_M = FIXED_ROUTE_TOLERANCE_M
 DISPLACED_GATE_TOLERANCE_M = 0.3
 SAFE_GATE_CLEARANCE_M = 0.3
 ORDINARY_PLAN_CLEARANCE_BY_INDEX = {2: 0.3, 3: 0.2, 11: 0.3}
-ROUTE_GUIDANCE_VERSION = "national-test-reversible-composite-v33"
+ROUTE_GUIDANCE_VERSION = "national-test-reversible-composite-v37"
 CLEARANCE_COMPOSITE_ROUTE_INDEX = 3
-CLEARANCE_APPROACH_GATE = (40.2, 78.8, 0.5)
+CLEARANCE_APPROACH_GATE = (39.9, 78.8, 0.5)
 CLEARANCE_HANDOFF_XY = (39.0, 82.9)
 CLEARANCE_HANDOFF_TOLERANCE_M = 0.6
 CLEARANCE_TURN_CONTROL = Control(0.4, 0.2)
@@ -79,15 +79,18 @@ TERMINAL_TURN_CONTROLS = (
 )
 TERMINAL_TAIL_CONTROLS = (Control(0.4, 0.0), Control(0.1, 0.0))
 TERMINAL_EDGE_DURATION_S = 0.2
+TIME_INDEX_EPSILON_S = 1e-9
 ORDINARY_CLEARANCE_VISIT_REGIONS: dict[
     int,
     tuple[tuple[float, float, float], ...],
 ] = {
+    # Keep the live 2 -> 3 approach east of the buoy at (38.72, 77.22).
+    2: ((40.2, 76.6, 0.3),),
     4: ((39.0, 82.9, 0.6),),
     9: ((34.8, 98.6, 0.5),),
-    11: ((29.5, 94.0, 0.6),),
+    11: ((29.5, 94.0, 0.6), (27.0, 95.0, 0.5)),
 }
-ORDINARY_VISIT_MAX_START_Y = {11: 94.5}
+ORDINARY_VISIT_MAX_START_Y = {2: 76.9, 11: 94.5}
 _ROUTE_GATE_CACHE: dict[tuple[str, int], tuple[float, float]] = {}
 
 
@@ -278,7 +281,7 @@ def plan_clearance_exit(
                     minimum_clearance,
                     motion.min_clearance,
                 )
-                if not fixed_route_waypoint_reached(
+                if not fixed_route_ordinary_waypoint_reached(
                     compiled_map,
                     5,
                     states[-1],
@@ -320,10 +323,11 @@ def plan_clearance_exit(
                 break
 
     if not candidates:
-        goal_x, goal_y = fixed_route_goal_xy(
+        published_goal_x, published_goal_y = fixed_route_goal_xy(
             compiled_map.manifest,
             5,
         )
+        goal_x, goal_y, _ = fixed_route_gate_region(compiled_map, 5)
         next_x, next_y = fixed_route_goal_xy(
             compiled_map.manifest,
             6,
@@ -361,7 +365,7 @@ def plan_clearance_exit(
                 minimum_clearance,
                 motion.min_clearance,
             )
-            if not fixed_route_waypoint_reached(
+            if not fixed_route_ordinary_waypoint_reached(
                 compiled_map,
                 5,
                 states[-1],
@@ -383,8 +387,8 @@ def plan_clearance_exit(
                     len(controls),
                     heading_error,
                     math.hypot(
-                        states[-1].x - goal_x,
-                        states[-1].y - goal_y,
+                        states[-1].x - published_goal_x,
+                        states[-1].y - published_goal_y,
                     ),
                     controls,
                     durations,
@@ -842,6 +846,25 @@ def fixed_route_waypoint_reached(
     )
 
 
+def fixed_route_ordinary_waypoint_reached(
+    compiled_map: CompiledSidecarMap,
+    mission_index: int,
+    state: VesselState,
+) -> bool:
+    """Require both the published circle and its collision-safe pass gate."""
+
+    if not fixed_route_waypoint_reached(compiled_map, mission_index, state):
+        return False
+    gate_x, gate_y, gate_tolerance = fixed_route_gate_region(
+        compiled_map,
+        mission_index,
+    )
+    return (
+        math.hypot(state.x - gate_x, state.y - gate_y)
+        <= gate_tolerance + 1e-9
+    )
+
+
 def fixed_route_planning_gate(
     compiled_map: CompiledSidecarMap,
     mission_index: int,
@@ -1038,6 +1061,7 @@ def fixed_route_guidance_hash(compiled_map: CompiledSidecarMap) -> str:
             for control in TERMINAL_TAIL_CONTROLS
         ],
         "terminal_edge_duration_s": TERMINAL_EDGE_DURATION_S,
+        "time_index_epsilon_s": TIME_INDEX_EPSILON_S,
         "ordinary_clearance_visit_regions": (
             ORDINARY_CLEARANCE_VISIT_REGIONS
         ),
@@ -1709,6 +1733,7 @@ __all__ = [
     "TERMINAL_ROUTE_INDEX",
     "TERMINAL_TAIL_CONTROLS",
     "TERMINAL_TURN_CONTROLS",
+    "TIME_INDEX_EPSILON_S",
     "FixedRoutePlan",
     "GeometryGateEvidence",
     "NarrowCompositeInfeasibleError",
@@ -1720,6 +1745,7 @@ __all__ = [
     "fixed_route_guidance_hash",
     "fixed_route_gate_region",
     "fixed_route_goal_xy",
+    "fixed_route_ordinary_waypoint_reached",
     "fixed_route_planning_gate",
     "fixed_route_tolerance",
     "fixed_route_waypoint_reached",

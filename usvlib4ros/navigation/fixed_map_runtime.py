@@ -8,6 +8,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from usvlib4ros.mapping import (
@@ -53,6 +54,7 @@ from usvlib4ros.planning.fixed_route import (
     fixed_route_gate_region,
     fixed_route_goal_xy,
     fixed_route_guidance_hash,
+    fixed_route_ordinary_waypoint_reached,
     fixed_route_waypoint_reached,
     is_clearance_composite_trajectory,
     is_clearance_exit_trajectory,
@@ -76,6 +78,9 @@ from usvlib4ros.policy.fixed_map_features import (
     reverse_tracking_control,
     tracking_rudder_limit,
     tracking_future_controls,
+    terminal_braking_padding,
+    time_indexed_trajectory_future_controls,
+    trajectory_replan_required,
 )
 from usvlib4ros.policy.recurrent_sac import (
     RecurrentDiscreteSAC,
@@ -98,6 +103,12 @@ DEFAULT_CHECKPOINT = (
     / "artifacts"
     / "checkpoints"
     / "national_test_sac_live_v10_tested.pt"
+)
+DEFAULT_UNITY_TEST_CHECKPOINT = (
+    PROJECT_ROOT
+    / "artifacts"
+    / "checkpoints"
+    / "national_test_sac_v37_unity_test.pt"
 )
 ROUTE_FIT_TOLERANCE_M = 0.05
 APPROVED_TRANSFORM_TOLERANCE_M = 0.05
@@ -157,6 +168,41 @@ def _route_points(route) -> tuple[object, ...]:
     if not points:
         raise ValueError("live route contains no points")
     return points
+
+
+def approved_fixed_route_fallback():
+    """Build the bound National_Test route when Unity returns no route.
+
+    The fixed competition scene has one approved route. Its GPS points are
+    derived from the hash-checked sidecar compilation, so an empty ROS route
+    cannot trigger a reset loop or weaken the existing live-route checks.
+    """
+
+    compiled = compile_offline_national_map(
+        session_id="approved-fixed-route-fallback"
+    )
+    manifest = compiled.manifest
+    projector = GpsProjector(*manifest.gps_origin)
+    points = tuple(
+        SimpleNamespace(lat=lat, lng=lng)
+        for lat, lng in (
+            projector.enu_to_gps(x, y)
+            for x, y in manifest.route_points_enu
+        )
+    )
+    profile = json.loads(
+        (
+            SIDECAR_PATH.parent / "national_test_live_profile.json"
+        ).read_text(encoding="utf-8")
+    )
+    return SimpleNamespace(
+        id=manifest.route_id,
+        name=manifest.route_name,
+        version=int(profile["observed_ros_route_version"]),
+        start_index=0,
+        points=points,
+        obstacles=(),
+    )
 
 
 def build_live_route_context(
@@ -798,25 +844,20 @@ class FixedMapControllerCore:
         ):
             return False
         while True:
-            gate_x, gate_y, gate_tolerance = fixed_route_gate_region(
-                self.context.compiled_map,
-                self.mission_index,
-            )
-            reached_published_point = fixed_route_waypoint_reached(
-                self.context.compiled_map,
-                self.mission_index,
-                state,
-            )
-            if not reached_published_point:
-                break
-            if (
-                self.mission_index != NARROW_ROUTE_INDEX
-                and math.hypot(
-                    state.x - gate_x,
-                    state.y - gate_y,
+            reached = (
+                fixed_route_waypoint_reached(
+                    self.context.compiled_map,
+                    self.mission_index,
+                    state,
                 )
-                > gate_tolerance + 1e-9
-            ):
+                if self.mission_index == NARROW_ROUTE_INDEX
+                else fixed_route_ordinary_waypoint_reached(
+                    self.context.compiled_map,
+                    self.mission_index,
+                    state,
+                )
+            )
+            if not reached:
                 break
             if self.mission_index >= len(points) - 1:
                 return True
@@ -1017,20 +1058,19 @@ class FixedMapControllerCore:
                 ),
             )
             replanned = True
-        if (
-            self.maneuver_phase != "ESCAPE_PENDING"
-            and (
-                preview.cross_track_error_m > 0.8
-                or (
-                preview.state_index
-                >= len(self.trajectory.states) - 2
-                and self._gate_distance(state)
-                > fixed_route_gate_region(
-                    self.context.compiled_map,
-                    self.mission_index,
-                )[2]
-                )
-            )
+        if trajectory_replan_required(
+            preview,
+            self.trajectory,
+            maneuver_phase=self.maneuver_phase,
+            gate_distance_m=self._gate_distance(state),
+            gate_tolerance_m=fixed_route_gate_region(
+                self.context.compiled_map,
+                self.mission_index,
+            )[2],
+            endpoint_gate_replan=(
+                self.mission_index >= NARROW_ROUTE_INDEX + 1
+                and is_terminal_route_trajectory(self.trajectory)
+            ),
         ):
             self.trajectory = None
             self.trajectory_index = 0
@@ -1067,6 +1107,14 @@ class FixedMapControllerCore:
         )
         deterministic_clearance_exit = is_clearance_exit_trajectory(
             self.trajectory
+        )
+        deterministic_narrow_ingress = (
+            deterministic_narrow
+            and self.maneuver_phase != "ESCAPE_PENDING"
+        )
+        deterministic_narrow = (
+            deterministic_narrow
+            and self.maneuver_phase == "ESCAPE_PENDING"
         )
         deterministic_special = (
             deterministic_egress
@@ -1113,31 +1161,40 @@ class FixedMapControllerCore:
                     self.mission_index,
                 ),
             )
-        remaining_horizon = (
-            FIXED_MAP_PREDICTION_HORIZON_S - 0.3
-        )
-        skip = 0.3
-        nominal_future_controls = []
-        for control, duration in zip(
-            self.trajectory.controls[preview.nominal_control_index :],
-            self.trajectory.durations[preview.nominal_control_index :],
-        ):
-            if remaining_horizon <= 1e-12:
-                break
-            available = float(duration)
-            if skip > 1e-12:
-                removed = min(skip, available)
-                available -= removed
-                skip -= removed
-            if available <= 1e-12:
-                continue
-            applied = min(available, remaining_horizon)
-            nominal_future_controls.append((control, applied))
-            remaining_horizon -= applied
-        if remaining_horizon > 1e-12:
-            nominal_future_controls.append(
-                (self.trajectory.controls[-1], remaining_horizon)
+        remaining_horizon = FIXED_MAP_PREDICTION_HORIZON_S - 0.3
+        if deterministic_special:
+            nominal_future_controls = list(
+                time_indexed_trajectory_future_controls(
+                    self.trajectory,
+                    preview,
+                    state_stamp_sim=state.stamp_sim,
+                    candidate_prefix_s=0.3,
+                    remaining_horizon_s=remaining_horizon,
+                )
             )
+        else:
+            skip = 0.3
+            nominal_future_controls = []
+            for control, duration in zip(
+                self.trajectory.controls[preview.nominal_control_index :],
+                self.trajectory.durations[preview.nominal_control_index :],
+            ):
+                if remaining_horizon <= 1e-12:
+                    break
+                available = float(duration)
+                if skip > 1e-12:
+                    removed = min(skip, available)
+                    available -= removed
+                    skip -= removed
+                if available <= 1e-12:
+                    continue
+                applied = min(available, remaining_horizon)
+                nominal_future_controls.append((control, applied))
+                remaining_horizon -= applied
+            if remaining_horizon > 1e-12:
+                nominal_future_controls.extend(
+                    terminal_braking_padding(remaining_horizon)
+                )
         reverse_nominal = nominal.throttle < 0.0
         overspeed_braking = (
             planned_nominal.throttle >= 0.0
@@ -1145,7 +1202,9 @@ class FixedMapControllerCore:
             and not ingress_recovery
         )
         nominal_future_controls = (
-            narrow_ingress_future_controls(
+            tuple(nominal_future_controls)
+            if deterministic_special
+            else narrow_ingress_future_controls(
                 nominal,
                 tuple(nominal_future_controls),
             )
@@ -1223,7 +1282,19 @@ class FixedMapControllerCore:
             )
         if not any(safe_mask):
             return self._stop("NO_SAFE_ACTION", state)
-        if reverse_nominal or ingress_recovery or deterministic_special:
+        if deterministic_narrow_ingress:
+            policy_action = minimum_intervention_action(
+                policy_action=2,
+                safe_action_mask=safe_mask,
+                candidates=candidates,
+                nominal_control=candidates[2].control,
+            )
+            next_hidden = self.hidden
+        elif (
+            reverse_nominal
+            or ingress_recovery
+            or deterministic_special
+        ):
             policy_action = 2
             next_hidden = self.hidden
         else:
@@ -1275,6 +1346,7 @@ class FixedMapControllerCore:
             not reverse_nominal
             and not ingress_recovery
             and not deterministic_special
+            and not deterministic_narrow_ingress
         ):
             self.hidden = next_hidden
             self.hidden_reset = False
@@ -1287,6 +1359,8 @@ class FixedMapControllerCore:
                 if overspeed_braking
                 else "NARROW_INGRESS_RECOVERY"
                 if ingress_recovery
+                else "NARROW_INGRESS_NOMINAL"
+                if deterministic_narrow_ingress
                 else "NARROW_EGRESS_NOMINAL"
                 if deterministic_egress
                 else "CLEARANCE_COMPOSITE_NOMINAL"
@@ -1309,11 +1383,13 @@ class FixedMapControllerCore:
 
 __all__ = [
     "DEFAULT_CHECKPOINT",
+    "DEFAULT_UNITY_TEST_CHECKPOINT",
     "FixedMapControllerCore",
     "LiveInputAdapter",
     "LiveRouteContext",
     "RuntimeDecision",
     "RuntimeInput",
+    "approved_fixed_route_fallback",
     "build_live_route_context",
     "load_live_ready_policy",
     "load_offline_ready_policy",

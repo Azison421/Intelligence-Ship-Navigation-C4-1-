@@ -10,6 +10,7 @@ from usvlib4ros.planning import Control
 from usvlib4ros.planning.forward_control_profile import (
     ForwardControlProfile,
 )
+from usvlib4ros.planning.fixed_route import FIXED_ROUTE_TOLERANCE_M
 from usvlib4ros.policy.fixed_map_trainer import (
     FixedMapSACTrainer,
     LIVE_RESET_SPAWN_X_M,
@@ -155,6 +156,8 @@ def test_nominal_future_starts_after_candidate_prefix():
 
     assert future[:2] == ((first, 0.5), (second, 0.8))
     assert sum(duration for _, duration in future) == 1.7
+    assert future[2][0] == Control(-0.4, 0.0)
+    assert abs(future[2][1] - 0.4) <= 1e-12
 
 
 def test_fixed_map_sac_trains_complete_safe_episode_and_saves_checkpoint(
@@ -209,6 +212,23 @@ def test_fixed_map_sac_trains_complete_safe_episode_and_saves_checkpoint(
     assert episodes[0].completed
     assert not episodes[0].timeout
     assert episodes[0].mission_index == 13
+    assert len(episodes[0].waypoint_min_distances_m) == 13
+    assert all(
+        distance <= FIXED_ROUTE_TOLERANCE_M + 1e-9
+        for distance in episodes[0].waypoint_min_distances_m
+    )
+    reached_steps = episodes[0].waypoint_reached_steps
+    assert len(reached_steps) == 13
+    assert all(step is not None for step in reached_steps)
+    assert all(
+        first < second
+        for first, second in zip(reached_steps, reached_steps[1:])
+    )
+    assert (
+        reached_steps[10]
+        < episodes[0].narrow_escape_release_step
+        < reached_steps[11]
+    )
     assert (
         episodes[0].minimum_clearance_m
         > trainer.compiled_map.snapshot.required_clearance
@@ -224,7 +244,7 @@ def test_fixed_map_sac_trains_complete_safe_episode_and_saves_checkpoint(
         "national-test-sac-checkpoint-v4"
     )
     assert manifest["route_guidance_version"] == (
-        "national-test-reversible-composite-v33"
+        "national-test-reversible-composite-v37"
     )
     assert manifest["algorithm"] == "discrete-recurrent-sac"
     assert manifest["dynamics_version"] == trainer.dynamics.version

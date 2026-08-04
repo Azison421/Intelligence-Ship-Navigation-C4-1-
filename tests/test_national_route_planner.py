@@ -41,6 +41,7 @@ from usvlib4ros.planning.fixed_route import (
     build_fixed_leg_request,
     compile_offline_national_map,
     fixed_route_goal_xy,
+    fixed_route_gate_region,
     fixed_route_geometry_candidates,
     is_clearance_composite_trajectory,
     is_clearance_exit_trajectory,
@@ -313,6 +314,46 @@ def test_point_four_request_visits_published_point_then_ends_at_safe_handoff():
     assert is_clearance_composite_trajectory(trajectory)
 
 
+def test_point_four_composite_keeps_clearance_after_point_three_east_gate():
+    """The live point-three arrival must leave margin for the next buoy pass."""
+
+    compiled = compile_offline_national_map(
+        session_id="point-four-after-east-gate",
+    )
+    profile = ForwardControlProfile(
+        calibration_hash="0" * 64,
+        minimum_steerage_throttle=0.1,
+        cruise_throttle=0.4,
+        action_controls=(
+            Control(0.1, -0.5),
+            Control(0.4, -0.2),
+            Control(0.4, 0.0),
+            Control(0.4, 0.2),
+            Control(0.4, 0.5),
+        ),
+        throttle_speed_gain=1.2681317113395243,
+        positive_rudder_yaw_rate_gain=1.962635624471142,
+        negative_rudder_yaw_rate_gain=2.048615259634089,
+    )
+    trajectory = plan_fixed_leg(
+        compiled,
+        start_state=VesselState(
+            x=39.99182511134593,
+            y=77.3913731240417,
+            yaw=1.2087803047104109,
+            speed=0.12681330183438116,
+            yaw_rate=0.007204442569118387,
+            stamp_sim=65.5,
+        ),
+        mission_index=CLEARANCE_COMPOSITE_ROUTE_INDEX,
+        dynamics=reduced_dynamics_from_profile(profile),
+        forward_action_controls=profile.action_controls,
+        seed=31,
+    )
+
+    assert trajectory.min_clearance >= 0.4
+
+
 def test_point_four_replan_preserves_completed_approach_progress():
     compiled = compile_offline_national_map(
         session_id="point-four-progress-replan",
@@ -391,6 +432,11 @@ def test_clearance_exit_recovers_varied_point_five_arrival_heading():
         5,
         trajectory.states[-1],
     )
+    gate_x, gate_y, gate_tolerance = fixed_route_gate_region(compiled, 5)
+    assert math.hypot(
+        trajectory.states[-1].x - gate_x,
+        trajectory.states[-1].y - gate_y,
+    ) <= gate_tolerance
     assert trajectory.min_clearance > 0.2
 
 
@@ -810,7 +856,10 @@ def test_live_third_leg_uses_calibrated_east_bend_with_reverse_profile_loaded():
         lookahead_count=0,
     )
 
-    assert not request.required_visit_regions
+    assert tuple(
+        (region.x, region.y, region.position_tolerance)
+        for region in request.required_visit_regions
+    ) == ((40.2, 76.6, 0.3),)
 
     trajectory = plan_fixed_leg(
         compiled,
@@ -829,6 +878,10 @@ def test_live_third_leg_uses_calibrated_east_bend_with_reverse_profile_loaded():
 
     assert all(control.throttle >= 0.0 for control in trajectory.controls)
     assert trajectory.min_clearance >= 0.5
+    assert min(
+        math.hypot(state.x - 40.2, state.y - 76.6)
+        for state in trajectory.states
+    ) <= 0.3
 
 
 def test_escape_replan_does_not_require_revisiting_completed_narrow_point():
@@ -1260,3 +1313,31 @@ def test_fixed_leg_recovers_after_safe_policy_exploration():
         trajectory.min_clearance
         > compiled.snapshot.required_clearance
     )
+
+
+def test_point_twelve_routes_south_then_west_of_the_large_buoy():
+    compiled = compile_offline_national_map(
+        session_id="point-twelve-local-gates",
+    )
+    profile = _formal_profile_shape()
+    request = build_fixed_leg_request(
+        compiled,
+        start_state=VesselState(
+            x=32.883,
+            y=93.819,
+            yaw=math.pi,
+            speed=0.5,
+            yaw_rate=0.0,
+        ),
+        mission_index=11,
+        dynamics=reduced_dynamics_from_profile(profile),
+        cost_config=CostConfig(),
+        time_budget_ms=5_000.0,
+        seed=31,
+        lookahead_count=1,
+    )
+
+    assert tuple(
+        (region.x, region.y, region.position_tolerance)
+        for region in request.required_visit_regions
+    ) == ((29.5, 94.0, 0.6), (27.0, 95.0, 0.5))

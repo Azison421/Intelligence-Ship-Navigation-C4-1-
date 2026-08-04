@@ -17,6 +17,8 @@ from usvlib4ros.policy.fixed_map_features import (
     reverse_tracking_control,
     tracking_rudder_limit,
     tracking_future_controls,
+    time_indexed_trajectory_future_controls,
+    trajectory_replan_required,
 )
 
 
@@ -353,6 +355,57 @@ def test_trajectory_preview_can_follow_variable_primitive_times():
     assert preview.nominal_control_index == 1
 
 
+def test_time_indexed_preview_tolerates_control_period_roundoff():
+    states = (
+        VesselState(
+            x=0.0,
+            y=0.0,
+            yaw=0.0,
+            speed=0.1,
+            yaw_rate=0.0,
+            stamp_sim=10.0,
+        ),
+        VesselState(
+            x=1.0,
+            y=0.0,
+            yaw=0.0,
+            speed=0.1,
+            yaw_rate=0.0,
+            stamp_sim=10.2,
+        ),
+        VesselState(
+            x=2.0,
+            y=0.0,
+            yaw=0.0,
+            speed=0.1,
+            yaw_rate=0.0,
+            stamp_sim=10.4,
+        ),
+    )
+    trajectory = SimpleNamespace(
+        states=states,
+        controls=(Control(0.1, 0.0), Control(0.4, 0.0)),
+        times=(0.0, 0.2, 0.4),
+    )
+
+    preview = preview_trajectory(
+        VesselState(
+            x=1.0,
+            y=0.0,
+            yaw=0.0,
+            speed=0.1,
+            yaw_rate=0.0,
+            stamp_sim=10.2 - 5e-13,
+        ),
+        trajectory,
+        previous_index=0,
+        time_indexed=True,
+    )
+
+    assert preview.state_index == 1
+    assert preview.nominal_control_index == 1
+
+
 def test_trajectory_preview_does_not_jump_to_overlapping_escape_branch():
     states = (
         VesselState(x=0.0, y=0.0, yaw=0.0, speed=0.2, yaw_rate=0.0),
@@ -439,6 +492,42 @@ def test_tracking_prediction_holds_closed_loop_control_before_plan():
     assert future == ((tracking, 0.5), *planned)
 
 
+def test_time_indexed_future_uses_only_the_unelapsed_control_remainder():
+    first = Control(0.4, 0.0)
+    second = Control(0.4, 0.2)
+    third = Control(0.4, -0.2)
+    trajectory = SimpleNamespace(
+        controls=(first, second, third),
+        durations=(0.8, 0.8, 0.8),
+        times=(0.0, 0.8, 1.6, 2.4),
+        states=(SimpleNamespace(stamp_sim=10.0),),
+    )
+    preview = TrajectoryPreview(
+        state_index=1,
+        nominal_control_index=1,
+        cross_track_error_m=0.0,
+        remaining_arc_length_m=1.0,
+        progress=0.5,
+        lookahead_x=0.0,
+        lookahead_y=1.0,
+        heading_error=0.0,
+    )
+
+    future = time_indexed_trajectory_future_controls(
+        trajectory,
+        preview,
+        state_stamp_sim=11.2,
+        candidate_prefix_s=0.3,
+        remaining_horizon_s=1.0,
+    )
+
+    assert future[0][0] == second
+    assert abs(future[0][1] - 0.1) <= 1e-12
+    assert future[1] == (third, 0.8)
+    assert future[2][0] == Control(-0.4, 0.0)
+    assert abs(future[2][1] - 0.1) <= 1e-12
+
+
 def test_overspeed_braking_prediction_does_not_resume_stale_forward_plan():
     braking = Control(-0.4, 0.0)
 
@@ -480,3 +569,47 @@ def test_reverse_tracking_corrects_the_failed_narrow_escape_pose():
     )
 
     assert control == Control(-0.4, -0.05)
+
+
+def test_finished_trajectory_replans_when_waypoint_gate_is_still_missed():
+    preview = TrajectoryPreview(
+        state_index=8,
+        nominal_control_index=8,
+        cross_track_error_m=0.1,
+        remaining_arc_length_m=0.1,
+        progress=0.95,
+        lookahead_x=0.0,
+        lookahead_y=0.0,
+        heading_error=0.0,
+    )
+    trajectory = SimpleNamespace(states=tuple(range(10)))
+
+    assert trajectory_replan_required(
+        preview,
+        trajectory,
+        maneuver_phase="NORMAL",
+        gate_distance_m=0.5449,
+        gate_tolerance_m=0.5,
+    )
+    assert not trajectory_replan_required(
+        preview,
+        trajectory,
+        maneuver_phase="NORMAL",
+        gate_distance_m=0.4999,
+        gate_tolerance_m=0.5,
+    )
+    assert not trajectory_replan_required(
+        preview,
+        trajectory,
+        maneuver_phase="ESCAPE_PENDING",
+        gate_distance_m=0.5449,
+        gate_tolerance_m=0.5,
+    )
+    assert not trajectory_replan_required(
+        preview,
+        trajectory,
+        maneuver_phase="NORMAL",
+        gate_distance_m=0.5449,
+        gate_tolerance_m=0.5,
+        endpoint_gate_replan=False,
+    )

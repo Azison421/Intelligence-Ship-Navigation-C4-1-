@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "<string>", line 14, in <module>
+  File "G:\NavAlg - 副本\usvlib4ros\policy\fixed_map_trainer.py", line 787, in run_episode
+    else plan_clearance_turn(
+  File "<string>", line 10, in wrapped
+  File "G:\NavAlg - 副本\usvlib4ros\planning\fixed_route.py", line 470, in plan_clearance_turn
+    raise RuntimeError("clearance turn must start in the handoff")
+RuntimeError: clearance turn must start in the handoff

@@ -47,6 +47,7 @@ from usvlib4ros.planning.fixed_route import (
     fixed_route_goal_xy,
     fixed_route_gate_region,
     fixed_route_guidance_hash,
+    fixed_route_ordinary_waypoint_reached,
     fixed_route_tolerance,
     is_clearance_composite_trajectory,
     is_clearance_exit_trajectory,
@@ -78,6 +79,9 @@ from .fixed_map_features import (
     reverse_tracking_control,
     tracking_rudder_limit,
     tracking_future_controls,
+    terminal_braking_padding,
+    time_indexed_trajectory_future_controls,
+    trajectory_replan_required,
 )
 from .safety_supervisor import (
     CandidateControl,
@@ -459,6 +463,7 @@ class FixedMapSACTrainer:
         preview: TrajectoryPreview,
         *,
         force_nominal: bool = False,
+        deterministic_trajectory: bool = False,
     ) -> tuple[
         tuple[CandidateControl, ...],
         tuple[bool, ...],
@@ -515,11 +520,25 @@ class FixedMapSACTrainer:
                     feedback_control.rudder,
                 )
             )
-        planned_future = self._nominal_future_controls(
-            trajectory,
-            preview,
+        planned_future = (
+            time_indexed_trajectory_future_controls(
+                trajectory,
+                preview,
+                state_stamp_sim=state.stamp_sim,
+                candidate_prefix_s=0.3,
+                remaining_horizon_s=(
+                    FIXED_MAP_PREDICTION_HORIZON_S - 0.3
+                ),
+            )
+            if deterministic_trajectory
+            else self._nominal_future_controls(
+                trajectory,
+                preview,
+            )
         )
-        if force_nominal:
+        if deterministic_trajectory:
+            nominal_future_controls = planned_future
+        elif force_nominal:
             nominal_future_controls = narrow_ingress_future_controls(
                 nominal_control,
                 planned_future,
@@ -605,7 +624,7 @@ class FixedMapSACTrainer:
             controls.append((control, applied))
             remaining -= applied
         if remaining > 1e-12:
-            controls.append((trajectory.controls[-1], remaining))
+            controls.extend(terminal_braking_padding(remaining))
         return tuple(controls)
 
     def _active_goal(
@@ -749,11 +768,25 @@ class FixedMapSACTrainer:
                 )
                 <= NARROW_ESCAPE_TOLERANCE_M + 0.15
             )
+            gate_x, gate_y, gate_tolerance = fixed_route_gate_region(
+                self.compiled_map,
+                mission_index,
+            )
             if (
                 escape_egress_needed
-                or (
-                    preview.cross_track_error_m > 0.8
-                    and maneuver_phase != "ESCAPE_PENDING"
+                or trajectory_replan_required(
+                    preview,
+                    trajectory,
+                    maneuver_phase=maneuver_phase,
+                    gate_distance_m=math.hypot(
+                        state.x - gate_x,
+                        state.y - gate_y,
+                    ),
+                    gate_tolerance_m=gate_tolerance,
+                    endpoint_gate_replan=(
+                        mission_index >= NARROW_ROUTE_INDEX + 1
+                        and is_terminal_route_trajectory(trajectory)
+                    ),
                 )
             ):
                 planning_index = (
@@ -798,9 +831,19 @@ class FixedMapSACTrainer:
             nominal = trajectory.controls[
                 preview.nominal_control_index
             ]
+            deterministic_narrow = is_narrow_composite_trajectory(
+                trajectory
+            )
+            deterministic_narrow_ingress = (
+                deterministic_narrow
+                and maneuver_phase != "ESCAPE_PENDING"
+            )
             deterministic_special = (
                 is_narrow_egress_trajectory(trajectory)
-                or is_narrow_composite_trajectory(trajectory)
+                or (
+                    deterministic_narrow
+                    and maneuver_phase == "ESCAPE_PENDING"
+                )
                 or is_terminal_route_trajectory(trajectory)
                 or is_clearance_composite_trajectory(trajectory)
                 or is_clearance_exit_trajectory(trajectory)
@@ -830,6 +873,7 @@ class FixedMapSACTrainer:
                     force_nominal=(
                         ingress_recovery or deterministic_special
                     ),
+                    deterministic_trajectory=deterministic_special,
                 )
             )
             observation = self._observation(
@@ -868,7 +912,14 @@ class FixedMapSACTrainer:
                 )
                 break
 
-            if (
+            if deterministic_narrow_ingress:
+                policy_action = minimum_intervention_action(
+                    policy_action=2,
+                    safe_action_mask=safe_mask,
+                    candidates=candidates,
+                    nominal_control=candidates[2].control,
+                )
+            elif (
                 nominal.throttle < 0.0
                 or ingress_recovery
                 or deterministic_special
@@ -899,11 +950,25 @@ class FixedMapSACTrainer:
                 and self.rng.random() < nominal_action_probability
             ):
                 policy_action = 2
-            finalize_future_controls = self._nominal_future_controls(
-                trajectory,
-                preview,
+            finalize_future_controls = (
+                time_indexed_trajectory_future_controls(
+                    trajectory,
+                    preview,
+                    state_stamp_sim=state.stamp_sim,
+                    candidate_prefix_s=0.3,
+                    remaining_horizon_s=(
+                        FIXED_MAP_PREDICTION_HORIZON_S - 0.3
+                    ),
+                )
+                if deterministic_special
+                else self._nominal_future_controls(
+                    trajectory,
+                    preview,
+                )
             )
-            if ingress_recovery:
+            if deterministic_special:
+                pass
+            elif ingress_recovery:
                 finalize_future_controls = narrow_ingress_future_controls(
                     nominal,
                     finalize_future_controls,
@@ -983,19 +1048,10 @@ class FixedMapSACTrainer:
             elif mission_index == NARROW_ROUTE_INDEX:
                 advanced = goal.contains(next_state)
             else:
-                gate_x, gate_y, gate_tolerance = (
-                    fixed_route_gate_region(
-                        self.compiled_map,
-                        mission_index,
-                    )
-                )
-                advanced = (
-                    goal.contains(next_state)
-                    and math.hypot(
-                        next_state.x - gate_x,
-                        next_state.y - gate_y,
-                    )
-                    <= gate_tolerance + 1e-9
+                advanced = fixed_route_ordinary_waypoint_reached(
+                    self.compiled_map,
+                    mission_index,
+                    next_state,
                 )
             terminated = False
             next_hidden_reset = False
@@ -1079,7 +1135,13 @@ class FixedMapSACTrainer:
                     )
                 next_deterministic_special = (
                     is_narrow_egress_trajectory(trajectory)
+                    or (
+                        is_narrow_composite_trajectory(trajectory)
+                        and maneuver_phase == "ESCAPE_PENDING"
+                    )
+                    or is_terminal_route_trajectory(trajectory)
                     or is_clearance_composite_trajectory(trajectory)
+                    or is_clearance_exit_trajectory(trajectory)
                     or is_clearance_turn_trajectory(trajectory)
                 )
                 _, next_safe_mask, _, _, _, _ = self._safe_candidates(

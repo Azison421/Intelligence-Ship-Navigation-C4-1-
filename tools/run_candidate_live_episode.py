@@ -19,7 +19,10 @@ from usvlib4ros.navigation.device_action_bridge import (
 )
 from usvlib4ros.navigation.fixed_map_service import FixedMapNavigationService
 from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
-from usvlib4ros.policy.checkpoint_promotion import UNITY_LOG_SCHEMA
+from usvlib4ros.policy.checkpoint_promotion import (
+    PolicyMode,
+    UNITY_LOG_SCHEMA,
+)
 from usvlib4ros.usvRosUtil import USVRosbridgeClient
 
 
@@ -97,7 +100,7 @@ def main() -> int:
         data,
         checkpoint_path=checkpoint,
         action_bridge=bridge,
-        allow_offline_candidate=True,
+        policy_mode=PolicyMode.OFFLINE_VALIDATION,
     )
     completed = False
     final_zero_samples = 0

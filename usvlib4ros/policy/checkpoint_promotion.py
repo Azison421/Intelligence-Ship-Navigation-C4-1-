@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from hashlib import sha256
 import json
 from math import isfinite
@@ -11,6 +12,19 @@ from typing import Iterable
 
 MANIFEST_SCHEMA = "national-test-sac-checkpoint-v4"
 UNITY_LOG_SCHEMA = "national-test-unity-validation-v1"
+
+
+class PolicyMode(str, Enum):
+    """Explicit promotion gate for the SAC checkpoint loader.
+
+    Replace the ambiguous ``allow_offline_candidate`` /
+    ``allow_test_candidate`` booleans so the entrypoint can never
+    accidentally load a model that has not passed its required gates.
+    """
+
+    LIVE = "live"
+    OFFLINE_VALIDATION = "offline_validation"
+    UNITY_TEST = "unity_test"
 
 
 def _digest(path: Path) -> str:
@@ -91,4 +105,4 @@ def promote_checkpoint(
     return promoted
 
 
-__all__ = ["promote_checkpoint"]
+__all__ = ["MANIFEST_SCHEMA", "PolicyMode", "UNITY_LOG_SCHEMA", "promote_checkpoint"]

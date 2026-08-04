@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -11,11 +13,19 @@ from usvlib4ros.navigation.fixed_map_runtime import (
     FixedMapControllerCore,
     LiveInputAdapter,
     RuntimeDecision,
+    approved_fixed_route_fallback,
     build_live_route_context,
     load_live_ready_policy,
     load_offline_ready_policy,
     load_tested_candidate_policy,
 )
+from usvlib4ros.navigation.training_reports import (
+    DEFAULT_REPORTS_DIR,
+    EpisodeReport,
+    TrainingReportLogger,
+)
+from usvlib4ros.planning.fixed_route import SIDECAR_PATH
+from usvlib4ros.policy.checkpoint_promotion import PolicyMode
 from usvlib4ros.usvRosUtil import LogUtil
 
 
@@ -36,6 +46,46 @@ UNSAFE_STOP_REASONS = frozenset(
         "LASER_EMERGENCY_STOP",
     }
 )
+
+
+def policy_loader_for_mode(policy_mode: PolicyMode):
+    """Map an explicit policy mode to its fail-closed checkpoint loader.
+
+    ``LIVE`` is the strictest gate: the checkpoint must have passed both
+    offline evaluation and Unity live validation.  Candidate loaders are
+    reachable only through explicit validation modes.
+    """
+
+    if policy_mode == PolicyMode.UNITY_TEST:
+        return load_tested_candidate_policy
+    if policy_mode == PolicyMode.OFFLINE_VALIDATION:
+        return load_offline_ready_policy
+    return load_live_ready_policy
+
+
+def preflight_assets(checkpoint_path: Optional[Path] = None) -> None:
+    """Fail fast before connecting when any runtime asset is missing."""
+
+    checkpoint = Path(checkpoint_path or DEFAULT_CHECKPOINT)
+    required = (
+        ("checkpoint", checkpoint),
+        (
+            "checkpoint manifest",
+            checkpoint.with_suffix(checkpoint.suffix + ".json"),
+        ),
+        ("static world sidecar", SIDECAR_PATH),
+        (
+            "live affine profile",
+            SIDECAR_PATH.parent / "national_test_live_profile.json",
+        ),
+    )
+    missing = [
+        f"  {name}: {path}" for name, path in required if not path.is_file()
+    ]
+    if missing:
+        raise RuntimeError(
+            "Navigation assets are missing:\n" + "\n".join(missing)
+        )
 
 
 def advance_failure_streak(
@@ -96,18 +146,75 @@ class FixedMapNavigationService:
         *,
         checkpoint_path: Optional[Path] = None,
         action_bridge=None,
-        allow_offline_candidate: bool = False,
-        allow_test_candidate: bool = False,
+        policy_mode: PolicyMode = PolicyMode.LIVE,
+        single_episode: bool = True,
+        reports_dir: Optional[Path] = None,
     ) -> None:
         self.ros_ctrl = ros_ctrl
         self.global_data = global_data
         self.action_bridge = action_bridge
-        self.allow_offline_candidate = bool(allow_offline_candidate)
-        self.allow_test_candidate = bool(allow_test_candidate)
+        self.policy_mode = PolicyMode(policy_mode)
+        self.single_episode = bool(single_episode)
         self.checkpoint_path = Path(
             checkpoint_path or DEFAULT_CHECKPOINT
         )
+        self.reports_dir = Path(reports_dir or DEFAULT_REPORTS_DIR)
         self.last_episode_metrics = None
+        self._stop_event = threading.Event()
+
+    def request_stop(self) -> None:
+        """Ask the run loop to exit promptly; callers still publish zero."""
+
+        self._stop_event.set()
+
+    def _record_episode_report(
+        self,
+        logger: TrainingReportLogger,
+        episode: int,
+    ) -> None:
+        metrics = self.last_episode_metrics
+        if not isinstance(metrics, dict):
+            return
+        try:
+            global_episode = logger.record_episode(
+                EpisodeReport(
+                    episode=episode,
+                    total_steps=int(metrics.get("total_steps", 0)),
+                    completed=bool(metrics.get("completed", False)),
+                    completed_waypoints=int(
+                        metrics.get("completed_waypoints", 0)
+                    ),
+                    duration_s=float(metrics.get("duration_s", 0.0)),
+                    waypoint_reached_steps=tuple(
+                        metrics.get("waypoint_reached_steps", ())
+                    ),
+                    waypoint_min_distances_m=tuple(
+                        metrics.get("waypoint_min_distances_m", ())
+                    ),
+                    stop_reason=str(metrics.get("stop_reason", "")),
+                    replans=int(metrics.get("replans", 0)),
+                    collisions=int(metrics.get("collisions", 0)),
+                    laser_emergency_stops=int(
+                        metrics.get("laser_emergency_stops", 0)
+                    ),
+                    unrecovered_unsafe_events=int(
+                        metrics.get("unrecovered_unsafe_events", 0)
+                    ),
+                )
+            )
+        except (OSError, ValueError) as exc:
+            LogUtil.error(f"training report write failed: {exc}")
+            return
+        print(
+            f"Training report episode {global_episode} written to "
+            f"{logger.reports_dir}"
+        )
+
+    def _task_status_active(self) -> bool:
+        return int(
+            getattr(self.global_data.device_data, "task_status", 0)
+            or 0
+        ) != 0
 
     def _publish_zero(
         self,
@@ -193,7 +300,10 @@ class FixedMapNavigationService:
         else:
             initial_request_time = float(initial_request_time)
         observed_current_request = False
-        while time.monotonic() < deadline:
+        while (
+            time.monotonic() < deadline
+            and not self._stop_event.is_set()
+        ):
             if int(
                 getattr(
                     self.global_data.device_data,
@@ -232,7 +342,10 @@ class FixedMapNavigationService:
 
     def _wait_for_auto(self, timeout_s: float = 10.0) -> bool:
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+        while (
+            time.monotonic() < deadline
+            and not self._stop_event.is_set()
+        ):
             if int(
                 getattr(
                     self.global_data.device_data,
@@ -248,7 +361,10 @@ class FixedMapNavigationService:
 
     def _wait_for_pose(self, timeout_s: float = 10.0):
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+        while (
+            time.monotonic() < deadline
+            and not self._stop_event.is_set()
+        ):
             pose = getattr(self.global_data.scada_data, "pose", None)
             lat = float(getattr(pose, "lat", 0.0) or 0.0)
             lng = float(getattr(pose, "lng", 0.0) or 0.0)
@@ -271,16 +387,20 @@ class FixedMapNavigationService:
             pose,
             session_id=f"unity-episode-{episode}-{int(time.time())}",
         )
-        if self.allow_test_candidate:
-            loader = load_tested_candidate_policy
-            print(
-                "Operator candidate validation mode; live promotion is "
-                "still pending."
-            )
-        elif self.allow_offline_candidate:
-            loader = load_offline_ready_policy
-        else:
-            loader = load_live_ready_policy
+        manifest_path = self.checkpoint_path.with_suffix(
+            self.checkpoint_path.suffix + ".json"
+        )
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )
+        print(
+            f"[{self.policy_mode.value}] loading policy "
+            f"{self.checkpoint_path} "
+            f"sha256={manifest.get('checkpoint_sha256')} "
+            f"offline_ready={manifest.get('offline_ready')} "
+            f"live_ready={manifest.get('live_ready')}"
+        )
+        loader = policy_loader_for_mode(self.policy_mode)
         policy = loader(
             self.checkpoint_path,
             context,
@@ -297,6 +417,7 @@ class FixedMapNavigationService:
             for point in context.compiled_map.manifest.route_points_enu
         )
         waypoint_min_distances = [float("inf")] * len(points)
+        waypoint_reached_steps = [None] * len(points)
         laser_stops = 0
         unsafe_events = 0
         collision_indicators = 0
@@ -305,16 +426,13 @@ class FixedMapNavigationService:
         laser_stop_started_s = None
         unsafe_streak = 0
         completed = False
+        total_steps = 0
         try:
             for step in range(MAX_STEPS):
-                if int(
-                    getattr(
-                        self.global_data.device_data,
-                        "task_status",
-                        0,
-                    )
-                    or 0
-                ) == 0:
+                if self._stop_event.is_set():
+                    self._publish_zero(mission_index=core.mission_index)
+                    return False
+                if not self._task_status_active():
                     print(f"Stop train step {step}...")
                     self._publish_zero(mission_index=core.mission_index)
                     return False
@@ -334,7 +452,17 @@ class FixedMapNavigationService:
                         )
                         ** 0.5,
                     )
+                previous_mission_index = core.mission_index
                 decision = core.step(sample)
+                total_steps = step + 1
+                for reached_index in range(
+                    previous_mission_index,
+                    min(decision.mission_index, len(points)),
+                ):
+                    if waypoint_reached_steps[reached_index] is None:
+                        waypoint_reached_steps[reached_index] = step + 1
+                if decision.completed:
+                    waypoint_reached_steps[-1] = step + 1
                 valid_laser = tuple(
                     value
                     for value, valid in zip(
@@ -451,10 +579,13 @@ class FixedMapNavigationService:
             return False
         finally:
             self.last_episode_metrics = {
+                "total_steps": total_steps,
+                "completed": completed,
                 "duration_s": time.monotonic() - started,
-                "completed_waypoints": (
-                    13 if completed else core.mission_index
+                "completed_waypoints": sum(
+                    step is not None for step in waypoint_reached_steps
                 ),
+                "waypoint_reached_steps": waypoint_reached_steps,
                 "waypoint_min_distances_m": waypoint_min_distances,
                 "collisions": collision_indicators,
                 "laser_emergency_stops": laser_stops,
@@ -473,29 +604,31 @@ class FixedMapNavigationService:
             self.ros_ctrl.initParameterList()
         except Exception as exc:
             LogUtil.error(exc)
-        while True:
+        print(
+            f"policy_mode={self.policy_mode.value} "
+            f"single_episode={self.single_episode} "
+            f"checkpoint={self.checkpoint_path}"
+        )
+        while not self._stop_event.is_set():
             try:
                 print("wait train button trigger ...")
-                while int(
-                    getattr(
-                        self.global_data.device_data,
-                        "task_status",
-                        0,
-                    )
-                    or 0
-                ) == 0:
+                while (
+                    not self._task_status_active()
+                    and not self._stop_event.is_set()
+                ):
                     self._publish_zero()
                     time.sleep(1.0)
+                if self._stop_event.is_set():
+                    break
 
+                report_logger = TrainingReportLogger.for_train_click(
+                    self.reports_dir
+                )
                 for episode in range(MAX_EPOCH):
-                    if int(
-                        getattr(
-                            self.global_data.device_data,
-                            "task_status",
-                            0,
-                        )
-                        or 0
-                    ) == 0:
+                    if (
+                        self._stop_event.is_set()
+                        or not self._task_status_active()
+                    ):
                         print("Stop train ...")
                         break
                     print(f"train {episode} ...")
@@ -522,10 +655,11 @@ class FixedMapNavigationService:
                         )
                     route = self.ros_ctrl.getRoute()
                     if not getattr(route, "points", None):
-                        LogUtil.info("Error : len(route.points) is 0. ")
-                        self._publish_zero()
-                        time.sleep(1.0)
-                        continue
+                        print(
+                            "Unity route service returned no points; using "
+                            "approved fixed route fallback"
+                        )
+                        route = approved_fixed_route_fallback()
                     print(
                         f"Route {getattr(route, 'name', 'unnamed')}: "
                         f"{len(route.points)} points, "
@@ -533,8 +667,15 @@ class FixedMapNavigationService:
                         "obstacles"
                     )
                     self.global_data.route = route
+                    self.last_episode_metrics = None
                     try:
-                        self._run_episode(route, episode)
+                        try:
+                            completed = self._run_episode(route, episode)
+                        finally:
+                            self._record_episode_report(
+                                report_logger,
+                                episode,
+                            )
                     except ValueError as exc:
                         if str(exc) != CHECKPOINT_PROMOTION_PENDING:
                             raise
@@ -543,16 +684,24 @@ class FixedMapNavigationService:
                             "live-ready. Stop and restart training after "
                             "promotion."
                         )
-                        while int(
-                            getattr(
-                                self.global_data.device_data,
-                                "task_status",
-                                0,
-                            )
-                            or 0
-                        ) != 0:
+                        while (
+                            self._task_status_active()
+                            and not self._stop_event.is_set()
+                        ):
                             self._publish_zero()
                             time.sleep(1.0)
+                        break
+                    if completed and self.single_episode:
+                        print(
+                            "Mission completed; single-episode mode, "
+                            "holding zero control until the task stops"
+                        )
+                        while (
+                            self._task_status_active()
+                            and not self._stop_event.is_set()
+                        ):
+                            self._publish_zero()
+                            time.sleep(0.1)
                         break
             except Exception as exc:
                 self._publish_zero()
@@ -562,4 +711,8 @@ class FixedMapNavigationService:
                 time.sleep(0.02)
 
 
-__all__ = ["FixedMapNavigationService"]
+__all__ = [
+    "FixedMapNavigationService",
+    "policy_loader_for_mode",
+    "preflight_assets",
+]

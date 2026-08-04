@@ -1,0 +1,115 @@
+G:\NavAlg - 副本\usvlib4ros\navigation\usv_ros2_controller.py(239):{'result': 0}
+policy_mode=unity_test checkpoint=artifacts\checkpoints\national_test_sac_v35_unity_test.pt waiting for the train trigger...
+{'client_id': 'navigation', 'action': 20, 'code': 1, 'data': ''}
+policy_mode=unity_test single_episode=True checkpoint=artifacts\checkpoints\national_test_sac_v35_unity_test.pt
+wait train button trigger ...
+train 0 ...
+Reset unity ...
+Unity route service returned no points; using approved fixed route fallback
+Route National_Test: 13 points, 0 obstacles
+[unity_test] loading policy artifacts\checkpoints\national_test_sac_v35_unity_test.pt sha256=ba9243d5db3d3375a974373e48f617308b37bce7712c233288a034c0f5beb271 offline_ready=False live_ready=False
+Step: 0, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 7.46
+Step: 20, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 7.20
+Step: 40, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 6.50
+Step: 60, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 5.75
+Step: 77, Action: 2, Reason: OVERSPEED_REVERSE_BRAKE, Point: 0, Distance: 5.13
+Step: 80, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 4.99
+Step: 100, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 4.39
+Step: 120, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 3.91
+Step: 140, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 3.50
+Step: 160, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 3.08
+Step: 180, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 2.70
+Step: 200, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 2.20
+Step: 220, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 1.90
+Step: 240, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 1.60
+Step: 260, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 1.36
+Step: 280, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 1.15
+Step: 300, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 0.93
+Step: 320, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 0.68
+Step: 340, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 0, Distance: 0.53
+Step: 346, Action: None, Reason: PLANNING_HOLD, Point: 1, Distance: 4.40
+Step: 347, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 4.39
+Step: 360, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 4.30
+Step: 380, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 3.71
+Step: 400, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 3.15
+Step: 410, Action: 2, Reason: OVERSPEED_REVERSE_BRAKE, Point: 1, Distance: 2.79
+Step: 414, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 2.63
+Step: 420, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 2.47
+Step: 440, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 2.22
+Step: 460, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 1.99
+Step: 480, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 1.79
+Step: 500, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 1.52
+Step: 501, Action: 2, Reason: OVERSPEED_REVERSE_BRAKE, Point: 1, Distance: 1.49
+Step: 507, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 1.40
+Step: 520, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 1.23
+Step: 540, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 0.96
+Step: 560, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 0.71
+Step: 567, Action: 2, Reason: OVERSPEED_REVERSE_BRAKE, Point: 1, Distance: 0.60
+Step: 571, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 1, Distance: 0.53
+Step: 574, Action: 2, Reason: PLANNING_BRAKE, Point: 2, Distance: 3.66
+Step: 576, Action: None, Reason: PLANNING_HOLD, Point: 2, Distance: 3.64
+Step: 577, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 3.62
+Step: 580, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 3.60
+Step: 600, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 3.37
+Step: 620, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 3.04
+Step: 640, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 2.70
+Step: 660, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 2.26
+Step: 680, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 1.99
+Step: 700, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 1.79
+Step: 720, Action: 2, Reason: POLICY_ACTION_SAFE, Point: 2, Distance: 1.56
+Step: 740, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 1.28
+Step: 749, Action: 2, Reason: CLEARANCE_RECOVERY, Point: 2, Distance: 1.15
+Step: 751, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 1.13
+Step: 760, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 1.06
+Step: 780, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.99
+Step: 800, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.98
+Step: 820, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.97
+Step: 840, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.97
+Step: 860, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 880, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 900, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 920, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 940, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 960, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 980, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1000, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1020, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1040, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1060, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1080, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1100, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1120, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1140, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1160, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1180, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1200, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1220, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1240, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1260, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1280, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1300, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1320, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.96
+Step: 1340, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1360, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1380, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1400, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1420, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1440, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1460, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1480, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1500, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1520, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.95
+Step: 1540, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1560, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1580, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1600, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1620, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1640, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1660, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1680, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1700, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Step: 1720, Action: None, Reason: MAP_INVALID, Point: 2, Distance: 0.94
+Stop train step 1738...
+Training report episode 1 written to G:\NavAlg - 副本\reports
+Stop train ...
+wait train button trigger ...

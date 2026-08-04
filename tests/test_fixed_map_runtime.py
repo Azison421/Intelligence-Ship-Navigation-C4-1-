@@ -32,6 +32,7 @@ from usvlib4ros.planning.fixed_route import (
     fixed_route_guidance_hash,
     fixed_route_planning_gate,
     is_narrow_egress_trajectory,
+    plan_fixed_leg,
 )
 from usvlib4ros.policy import RecurrentDiscreteSAC
 
@@ -720,6 +721,87 @@ def test_runtime_executes_safe_reverse_escape_without_calling_sac():
     assert decision.action == 2
     assert core.hidden is hidden
     assert not core.hidden_reset
+
+
+def test_runtime_executes_closed_loop_narrow_ingress_without_calling_sac():
+    route, pose = _live_route_and_pose()
+    context = replace(
+        build_live_route_context(
+            route,
+            pose,
+            session_id="runtime-narrow-ingress-test",
+        ),
+        start_index=NARROW_ROUTE_INDEX,
+    )
+    forward = ForwardControlProfile(
+        calibration_hash="0" * 64,
+        minimum_steerage_throttle=0.1,
+        cruise_throttle=0.4,
+        action_controls=(
+            Control(0.1, -0.5),
+            Control(0.4, -0.2),
+            Control(0.4, 0.0),
+            Control(0.4, 0.2),
+            Control(0.4, 0.5),
+        ),
+        throttle_speed_gain=1.2681317113395243,
+        positive_rudder_yaw_rate_gain=1.962635624471142,
+        negative_rudder_yaw_rate_gain=2.048615259634089,
+    )
+    reverse = ReverseControlProfile(
+        source_log_sha256="1" * 64,
+        command_throttle=-0.4,
+        command_signed_speed_mps=-0.12256225167642798,
+        reverse_throttle_speed_gain=0.3064056291910699,
+        max_reverse_speed_mps=0.2,
+    )
+    dynamics = enable_reverse_dynamics(
+        reduced_dynamics_from_profile(forward),
+        reverse,
+    )
+    policy = RecurrentDiscreteSAC(
+        observation_dim=162,
+        hidden_dim=16,
+        seed=31,
+    )
+    policy.forward_control_profile = forward
+    policy.reverse_control_profile = reverse
+    policy.reduced_dynamics = dynamics
+    policy.act = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("SAC must not replace the narrow ingress controller")
+    )
+    core = FixedMapControllerCore(context, policy)
+    previous = fixed_route_goal_xy(
+        context.compiled_map.manifest,
+        NARROW_ROUTE_INDEX - 1,
+    )
+    gate = fixed_route_planning_gate(
+        context.compiled_map,
+        NARROW_ROUTE_INDEX,
+    )
+    state = VesselState(
+        x=previous[0],
+        y=previous[1],
+        yaw=math.atan2(gate[1] - previous[1], gate[0] - previous[0]),
+        speed=0.3,
+        yaw_rate=0.0,
+        stamp_sim=0.0,
+    )
+    core.trajectory = plan_fixed_leg(
+        context.compiled_map,
+        start_state=state,
+        mission_index=NARROW_ROUTE_INDEX,
+        dynamics=dynamics,
+        forward_action_controls=(*forward.action_controls, reverse.control),
+        seed=71,
+        _allow_retry=False,
+    )
+
+    decision = core.step(_sample(context, vessel_state=state))
+
+    assert not decision.stop
+    assert decision.reason == "NARROW_INGRESS_NOMINAL"
+    assert decision.action is not None
 
 
 def test_runtime_replans_finished_reverse_branch_into_south_bypass():

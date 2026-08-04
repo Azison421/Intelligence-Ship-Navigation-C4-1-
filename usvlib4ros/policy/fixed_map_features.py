@@ -13,6 +13,7 @@ from usvlib4ros.planning import (
     Trajectory,
     VesselState,
 )
+from usvlib4ros.planning.fixed_route import TIME_INDEX_EPSILON_S
 
 from .recurrent_sac import LASER_COUNT, LocalObservationV2
 
@@ -49,6 +50,27 @@ class TrajectoryPreview:
     lookahead_x: float
     lookahead_y: float
     heading_error: float
+
+
+def trajectory_replan_required(
+    preview: TrajectoryPreview,
+    trajectory: Trajectory,
+    *,
+    maneuver_phase: str,
+    gate_distance_m: float,
+    gate_tolerance_m: float,
+    endpoint_gate_replan: bool = True,
+) -> bool:
+    """Keep runtime and offline replan gates identical at trajectory end."""
+
+    return maneuver_phase != "ESCAPE_PENDING" and (
+        preview.cross_track_error_m > 0.8
+        or (
+            endpoint_gate_replan
+            and preview.state_index >= len(trajectory.states) - 2
+            and gate_distance_m > gate_tolerance_m
+        )
+    )
 
 
 def _angle_difference(first: float, second: float) -> float:
@@ -93,7 +115,14 @@ def preview_trajectory(
         )
         index = min(
             len(trajectory.states) - 1,
-            max(previous_index, bisect_right(trajectory.times, elapsed) - 1),
+            max(
+                previous_index,
+                bisect_right(
+                    trajectory.times,
+                    elapsed + TIME_INDEX_EPSILON_S,
+                )
+                - 1,
+            ),
         )
     else:
         index = min(
@@ -337,6 +366,80 @@ def braking_future_controls(
     )
 
 
+def terminal_braking_padding(
+    remaining_s: float,
+) -> tuple[tuple[Control, float], ...]:
+    """Stop after a finite trajectory instead of repeating its last turn."""
+
+    if not math.isfinite(remaining_s) or remaining_s < 0.0:
+        raise ValueError("remaining prediction time must be finite and non-negative")
+    if remaining_s <= 1e-12:
+        return ()
+    brake_duration = min(0.7, remaining_s)
+    padding = [(Control(-0.4, 0.0), brake_duration)]
+    coast_duration = remaining_s - brake_duration
+    if coast_duration > 1e-12:
+        padding.append((Control(0.0, 0.0), coast_duration))
+    return tuple(padding)
+
+
+def time_indexed_trajectory_future_controls(
+    trajectory: Trajectory,
+    preview: TrajectoryPreview,
+    *,
+    state_stamp_sim: float,
+    candidate_prefix_s: float,
+    remaining_horizon_s: float,
+) -> tuple[tuple[Control, float], ...]:
+    """Predict from the unelapsed part of a time-indexed primitive chain."""
+
+    if not all(
+        math.isfinite(value)
+        for value in (
+            state_stamp_sim,
+            candidate_prefix_s,
+            remaining_horizon_s,
+        )
+    ):
+        raise ValueError("future-control timing must be finite")
+    if candidate_prefix_s < 0.0 or remaining_horizon_s < 0.0:
+        raise ValueError("future-control timing must be non-negative")
+    index = preview.nominal_control_index
+    if not 0 <= index < len(trajectory.controls):
+        raise ValueError("future-control index is outside the trajectory")
+    elapsed = max(
+        0.0,
+        state_stamp_sim - trajectory.states[0].stamp_sim,
+    )
+    elapsed_in_control = max(0.0, elapsed - trajectory.times[index])
+    skip = candidate_prefix_s
+    remaining = remaining_horizon_s
+    controls: list[tuple[Control, float]] = []
+    for offset, (control, duration) in enumerate(
+        zip(
+            trajectory.controls[index:],
+            trajectory.durations[index:],
+        )
+    ):
+        if remaining <= 1e-12:
+            break
+        available = float(duration)
+        if offset == 0:
+            available = max(0.0, available - elapsed_in_control)
+        if skip > 1e-12:
+            removed = min(skip, available)
+            available -= removed
+            skip -= removed
+        if available <= 1e-12:
+            continue
+        applied = min(available, remaining)
+        controls.append((control, applied))
+        remaining -= applied
+    if remaining > 1e-12:
+        controls.extend(terminal_braking_padding(remaining))
+    return tuple(controls)
+
+
 def front_arc_laser_features(
     ranges: Sequence[object] | Iterable[object],
     *,
@@ -436,4 +539,7 @@ __all__ = [
     "reverse_tracking_control",
     "tracking_rudder_limit",
     "tracking_future_controls",
+    "terminal_braking_padding",
+    "time_indexed_trajectory_future_controls",
+    "trajectory_replan_required",
 ]
