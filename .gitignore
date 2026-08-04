@@ -1,0 +1,11 @@
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.codex/
+aretifacts/
+# Project-local training and evaluation outputs.
+artifacts/checkpoints/
+artifacts/logs/
+artifacts/ros_archive/
