@@ -1,4 +1,4 @@
-"""Official sample entry name backed by the fixed National_Test algorithm."""
+"""Entry adapter required by the immutable official ``main.py``."""
 
 from __future__ import annotations
 
@@ -6,9 +6,6 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from usvlib4ros.navigation.device_action_bridge import (
-    create_ros_device_action_bridge,
-)
 from usvlib4ros.navigation.fixed_map_service import (
     FixedMapNavigationService,
 )
@@ -16,13 +13,7 @@ from usvlib4ros.policy.checkpoint_promotion import PolicyMode
 
 
 class DQN_NAV:
-    """Compatibility wrapper retained for ``usvlib4ros.main``.
-
-    The official entry runs in :attr:`PolicyMode.LIVE` by default, which
-    requires a checkpoint that passed both offline and Unity live
-    validation.  Candidate loaders are reachable only through an explicit
-    validation mode.
-    """
+    """Bind the immutable official entry to the National_Test service."""
 
     Instance = None
 
@@ -43,17 +34,9 @@ class DQN_NAV:
         self.global_data = global_data
         self.policy_mode = PolicyMode(policy_mode)
         self.navThread = None
-        self._stop_event = threading.Event()
-        device_id = getattr(ros_ctrl, "deviceId", None)
-        self._action_bridge = (
-            create_ros_device_action_bridge(device_id)
-            if device_id
-            else None
-        )
         self._service = FixedMapNavigationService(
             ros_ctrl,
             global_data,
-            action_bridge=self._action_bridge,
             policy_mode=self.policy_mode,
             checkpoint_path=checkpoint_path,
             single_episode=single_episode,
@@ -62,9 +45,10 @@ class DQN_NAV:
         )
 
     def startService(self):
-        if self._action_bridge is not None:
-            self._action_bridge.start(publish_hz=30.0)
-        self.navThread = threading.Thread(target=self.run)
+        self.navThread = threading.Thread(
+            target=self.run,
+            name="national-test-navigation",
+        )
         self.navThread.start()
 
     def run(self):
@@ -79,11 +63,8 @@ class DQN_NAV:
     def stop(self):
         """Request a clean shutdown: stop, zero control, join the thread."""
 
-        self._stop_event.set()
         self._service.request_stop()
         self._publish_zero()
-        if self._action_bridge is not None:
-            self._action_bridge.close()
         thread = self.navThread
         if (
             thread is not None
@@ -99,8 +80,6 @@ class DQN_NAV:
             0,
             0.0,
         )
-        if self._action_bridge is not None:
-            self._action_bridge.set_command(0, 0)
 
 
 __all__ = ["DQN_NAV"]

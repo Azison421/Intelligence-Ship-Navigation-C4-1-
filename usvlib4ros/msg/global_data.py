@@ -1,5 +1,4 @@
 import threading
-import time
 from types import SimpleNamespace
 
 
@@ -215,7 +214,9 @@ class GlobalData:
         self.navigation_output_data.advise_heading = advisedHeading
         self.navigation_output_data.point_index = int(nextPointIndex)
         self.navigation_output_data.distance = shipToNextWPDistance
-        self.navigation_output_data.time = time.time()
+        self.navigation_output_data.time = float(
+            getattr(self.device_data, "time", 0.0) or 0.0
+        )
         pass
 
     def updateAlgorithmOutput(self,e, step, score,loss,max_e,status):
@@ -225,7 +226,6 @@ class GlobalData:
         self.navigation_output_data.loss = loss
         self.navigation_output_data.max_e = int(max_e)
         self.navigation_output_data.status = int(status)
-        self.navigation_output_data.time = time.time()
         pass
 
 

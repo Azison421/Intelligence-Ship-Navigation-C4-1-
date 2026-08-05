@@ -10,7 +10,6 @@ __all__ = [
     "LogUtil",
     "NMEAUtil",
     "USVRosbridgeClient",
-    "USVAutoNavigationService",
 ]
 
 
@@ -19,10 +18,6 @@ def __getattr__(name: str):
         from usvlib4ros import usvRosUtil
 
         value = getattr(usvRosUtil, name)
-    elif name == "USVAutoNavigationService":
-        from usvlib4ros.navigation import USVAutoNavigationService
-
-        value = USVAutoNavigationService
     else:
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}"

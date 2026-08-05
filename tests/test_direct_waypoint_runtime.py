@@ -122,12 +122,9 @@ def _context():
 
 
 def _state(context, index: int, *, stamp: float = 0.0) -> VesselState:
-    x, y = fixed_route_goal_xy(context.compiled_map.manifest, index)
+    x, y = context.corridor.task_anchors[index]
     next_index = min(index + 1, 12)
-    next_x, next_y = fixed_route_goal_xy(
-        context.compiled_map.manifest,
-        next_index,
-    )
+    next_x, next_y = context.corridor.task_anchors[next_index]
     return VesselState(
         x=x,
         y=y,

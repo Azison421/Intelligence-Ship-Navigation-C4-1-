@@ -2,75 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from usvlib4ros.planning.forward_control_profile import ForwardControlProfile
-from usvlib4ros.planning.kinodynamic_informed_rrtstar import Control
+from usvlib4ros.planning.forward_control_profile import (
+    ACTION_SCHEMA as ACTION_SCHEMA_V3,
+)
 from usvlib4ros.policy.recurrent_sac import (
     LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3,
 )
 
 
 OBSERVATION_SCHEMA_V3 = LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3
-ACTION_SCHEMA_V3 = "five-calibrated-controls-v3"
 CHECKPOINT_SCHEMA_V6 = "national-test-sac-checkpoint-v6"
 REPLAY_SCHEMA_V3 = "national-test-replay-v3"
-
-
-def _percent_command(control: Control) -> tuple[int, int]:
-    return (
-        int(round(control.throttle * 100.0)),
-        int(round(control.rudder * 100.0)),
-    )
-
-
-@dataclass(frozen=True)
-class CalibratedActionSet:
-    """Five semantically ordered controls that remain unique on the wire."""
-
-    controls: tuple[Control, ...]
-    percent_commands: tuple[tuple[int, int], ...]
-    calibration_hash: str
-    schema_version: str = ACTION_SCHEMA_V3
-
-    @classmethod
-    def from_profile(
-        cls,
-        profile: ForwardControlProfile,
-    ) -> "CalibratedActionSet":
-        if not isinstance(profile, ForwardControlProfile):
-            raise ValueError("calibrated action set requires a forward profile")
-        if profile.action_schema != ACTION_SCHEMA_V3:
-            raise ValueError("forward profile action schema is incompatible")
-        controls = tuple(profile.action_controls)
-        percentages = tuple(_percent_command(control) for control in controls)
-        if len(set(percentages)) != 5:
-            raise ValueError("controls must remain unique after percent rounding")
-        rudders = tuple(command[1] for command in percentages)
-        if not (
-            rudders[0] < rudders[1] < 0
-            and rudders[2] == 0
-            and 0 < rudders[3] < rudders[4]
-        ):
-            raise ValueError(
-                "controls must be ordered hard-left, soft-left, straight, "
-                "soft-right, hard-right"
-            )
-        if any(command[0] <= 0 for command in percentages):
-            raise ValueError("all calibrated actions must provide forward steerage")
-        return cls(
-            controls=controls,
-            percent_commands=percentages,
-            calibration_hash=profile.calibration_hash,
-        )
-
-    def control(self, action: int) -> Control:
-        if isinstance(action, bool) or not isinstance(action, int):
-            raise ValueError("action must be an integer")
-        try:
-            return self.controls[action]
-        except IndexError as exc:
-            raise ValueError("action must be one of five calibrated controls") from exc
 
 
 class ActuatorTransitionGuard:

@@ -200,7 +200,7 @@ def test_corridor_projection_is_monotonic_across_narrow_segment_envelopes():
             speed=0.35,
             yaw_rate=0.2,
         )
-        projection = corridor.project(state, previous_progress)
+        projection = corridor.project(state, previous_progress, index)
         assert math.isfinite(projection.cross_track_error_m)
         assert math.isfinite(projection.heading_error_rad)
         assert projection.route_progress >= previous_progress

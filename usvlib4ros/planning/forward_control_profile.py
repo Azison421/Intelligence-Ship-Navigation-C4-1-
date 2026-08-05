@@ -15,8 +15,8 @@ from .kinodynamic_informed_rrtstar import (
 )
 
 
-ACTION_SCHEMA = "five-discrete-forward-bias-v2"
-PROFILE_SCHEMA = "forward-control-profile-v1"
+ACTION_SCHEMA = "five-calibrated-controls-v3"
+PROFILE_SCHEMA = "forward-control-profile-v2"
 MINIMUM_STEERAGE_YAW_RATE = radians(8.0)
 TARGET_CRUISE_SPEED_MPS = 0.4
 MAX_CALIBRATED_TURN_SPEED_MPS = 0.45
@@ -87,6 +87,14 @@ class ForwardControlProfile:
     def __post_init__(self) -> None:
         if len(self.calibration_hash) != 64:
             raise ValueError("calibration hash must be SHA-256")
+        try:
+            int(self.calibration_hash, 16)
+        except ValueError as exc:
+            raise ValueError("calibration hash must be SHA-256") from exc
+        if self.action_schema != ACTION_SCHEMA:
+            raise ValueError("forward-control action schema is incompatible")
+        if self.schema_version != PROFILE_SCHEMA:
+            raise ValueError("forward-control profile schema is incompatible")
         if not 0.0 < self.minimum_steerage_throttle <= 1.0:
             raise ValueError("minimum steerage throttle must be in (0, 1]")
         if not 0.0 < self.cruise_throttle <= 1.0:
@@ -96,6 +104,27 @@ class ForwardControlProfile:
             for control in self.action_controls
         ):
             raise ValueError("profile must contain five valid non-negative controls")
+        commands = tuple(
+            (
+                int(round(control.throttle * 100.0)),
+                int(round(control.rudder * 100.0)),
+            )
+            for control in self.action_controls
+        )
+        if len(set(commands)) != 5:
+            raise ValueError("controls must remain unique after percent rounding")
+        rudders = tuple(command[1] for command in commands)
+        if not (
+            rudders[0] < rudders[1] < 0
+            and rudders[2] == 0
+            and 0 < rudders[3] < rudders[4]
+        ):
+            raise ValueError(
+                "controls must be ordered hard-left, soft-left, straight, "
+                "soft-right, hard-right"
+            )
+        if any(command[0] <= 0 for command in commands):
+            raise ValueError("all calibrated actions must provide forward steerage")
         gains = (
             self.throttle_speed_gain,
             self.positive_rudder_yaw_rate_gain,
@@ -318,20 +347,19 @@ def initial_turn_probe_controls(
 
 
 def supplemental_turn_probe_controls(
-    profile: ForwardControlProfile,
+    steerage_throttle: float,
+    cruise_throttle: float,
 ) -> tuple[tuple[float, float], ...]:
     """Add only the locked 20%/50% turn probes at selected throttle levels."""
 
-    throttles = tuple(
-        sorted(
-            {
-                profile.minimum_steerage_throttle,
-                profile.cruise_throttle,
-            }
-        )
-    )
+    throttles = tuple(sorted({float(steerage_throttle), float(cruise_throttle)}))
+    if any(
+        not isfinite(throttle) or not 0.0 < throttle <= 1.0
+        for throttle in throttles
+    ):
+        raise ValueError("supplemental calibration throttles are invalid")
     low_speed = tuple(
-        (profile.minimum_steerage_throttle, rudder)
+        (float(steerage_throttle), rudder)
         for rudder in (0.05, -0.05, 0.1, -0.1)
     )
     established = tuple(
@@ -409,18 +437,6 @@ def reduced_dynamics_from_profile(
     )
 
 
-def diagnostic_forward_control_profile() -> ForwardControlProfile:
-    """Non-promotable hint from the earlier bounded 30% live response log."""
-
-    return build_forward_control_profile(
-        (
-            ForwardProbe(0.3, 0.0, 0.3635, 0.0, 0.0),
-            ForwardProbe(0.3, 0.3, 0.3635, -0.5027, 0.0),
-            ForwardProbe(0.3, -0.3, 0.3635, 0.4068, 0.0),
-        )
-    )
-
-
 def action_protocol_hash(profile: ForwardControlProfile) -> str:
     payload = {
         "action_schema": profile.action_schema,
@@ -449,7 +465,6 @@ __all__ = [
     "STRAIGHT_PROBE_THROTTLES",
     "build_forward_control_profile",
     "action_protocol_hash",
-    "diagnostic_forward_control_profile",
     "forward_probe_abort_reason",
     "forward_control_profile_from_dict",
     "initial_turn_probe_controls",

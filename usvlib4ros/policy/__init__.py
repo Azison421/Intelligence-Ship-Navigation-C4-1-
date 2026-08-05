@@ -1,7 +1,7 @@
 """Pure-Python policy and safety research modules."""
 
 from .recurrent_sac import (
-    LocalObservationV2,
+    LocalWaypointObservationV3,
     PolicyProposal,
     RecurrentHiddenState,
     RecurrentDiscreteSAC,
@@ -19,7 +19,7 @@ from .safety_supervisor import (
 __all__ = [
     "CandidateControl",
     "CandidateControlGenerator",
-    "LocalObservationV2",
+    "LocalWaypointObservationV3",
     "PolicyProposal",
     "RecurrentHiddenState",
     "PredictiveSafetySupervisor",

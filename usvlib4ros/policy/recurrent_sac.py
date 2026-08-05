@@ -1,19 +1,14 @@
-"""Discrete mask-aware Recurrent SAC for the PRD reduced observation schema.
-
-The implementation is deliberately self-contained and testable without ROS,
-Unity or MATLAB.  It keeps policy proposal, sequence replay, SAC updates and
-checkpoint manifests separate from the control/output adapter.
-"""
+"""V3-only masked recurrent discrete SAC for National_Test."""
 
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from math import isfinite
 from pathlib import Path
 from random import Random
 from time import perf_counter
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -22,9 +17,11 @@ from torch.nn import functional as F
 
 ACTION_COUNT = 5
 LASER_COUNT = 72
-CHECKPOINT_FORMAT = "recurrent-sac-v1"
-CHECKPOINT_FORMAT_V2 = "recurrent-sac-v2"
+OBSERVATION_DIM = 166
+ACTION_SCHEMA = "five-calibrated-controls-v3"
+CHECKPOINT_FORMAT = "recurrent-sac-v2"
 LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3 = "local-waypoint-observation-v3"
+REPLAY_SCHEMA_V3 = "national-test-replay-v3"
 
 
 def _finite_tensor(tensor: Tensor, name: str) -> None:
@@ -41,101 +38,21 @@ def _finite_modules(modules: Iterable[nn.Module], name: str = "parameters") -> N
 def _finite_value_tree(value: object, name: str) -> None:
     if isinstance(value, Tensor):
         _finite_tensor(value.detach(), name)
-    elif isinstance(value, dict):
-        for nested_value in value.values():
-            _finite_value_tree(nested_value, name)
+    elif isinstance(value, Mapping):
+        for nested in value.values():
+            _finite_value_tree(nested, name)
     elif isinstance(value, (list, tuple)):
-        for nested_value in value:
-            _finite_value_tree(nested_value, name)
+        for nested in value:
+            _finite_value_tree(nested, name)
     elif isinstance(value, float) and not isfinite(value):
         raise ValueError(f"{name} must be finite")
 
 
-def _as_tuple(values: Sequence[float] | Iterable[float]) -> tuple[float, ...]:
+def _float_tuple(values: Sequence[float] | Iterable[float]) -> tuple[float, ...]:
     try:
         return tuple(float(value) for value in values)
     except (TypeError, ValueError) as exc:
         raise ValueError("observation features must be numeric") from exc
-
-
-@dataclass(frozen=True)
-class LocalObservationV2:
-    """Reduced LocalObservationV2 with explicit laser and version fields."""
-
-    laser_ranges: tuple[float, ...]
-    laser_valid_mask: tuple[bool, ...]
-    scan_age_s: float
-    ego_features: tuple[float, ...] = ()
-    path_features: tuple[float, ...] = ()
-    target_features: tuple[float, ...] = ()
-    target_mask: tuple[bool, ...] = ()
-    safety_features: tuple[float, ...] = ()
-    event_features: tuple[float, ...] = ()
-    pose_age_s: float = 0.0
-    schema_version: str = "local-observation-v2-reduced"
-    session_id: str = "session-v0"
-    stamp_sim: float = 0.0
-    hidden_reset: bool = False
-
-    def __post_init__(self) -> None:
-        laser = _as_tuple(self.laser_ranges)
-        mask = tuple(self.laser_valid_mask)
-        object.__setattr__(self, "laser_ranges", laser)
-        object.__setattr__(self, "laser_valid_mask", mask)
-        if len(laser) != LASER_COUNT or len(mask) != LASER_COUNT:
-            raise ValueError("LocalObservationV2 requires 72 laser values and masks")
-        if any(not isinstance(value, bool) for value in mask):
-            raise ValueError("laser_valid_mask must contain booleans")
-        for field_name in (
-            "ego_features",
-            "path_features",
-            "target_features",
-            "safety_features",
-            "event_features",
-        ):
-            object.__setattr__(self, field_name, _as_tuple(getattr(self, field_name)))
-        target_mask = tuple(self.target_mask)
-        object.__setattr__(self, "target_mask", target_mask)
-        if any(not isinstance(value, bool) for value in target_mask):
-            raise ValueError("target_mask must contain booleans")
-        numeric = (
-            *laser,
-            self.scan_age_s,
-            *self.ego_features,
-            *self.path_features,
-            *self.target_features,
-            *self.safety_features,
-            *self.event_features,
-            self.pose_age_s,
-            self.stamp_sim,
-        )
-        if not all(torch.isfinite(torch.tensor(value, dtype=torch.float32)).item() for value in numeric):
-            raise ValueError("LocalObservationV2 values must be finite")
-        if self.scan_age_s < 0.0 or self.pose_age_s < 0.0:
-            raise ValueError("observation ages must be non-negative")
-        if not self.schema_version or not self.session_id:
-            raise ValueError("observation schema and session are required")
-
-    @property
-    def feature_dim(self) -> int:
-        return len(self.to_vector())
-
-    def to_vector(self) -> tuple[float, ...]:
-        return (
-            *self.laser_ranges,
-            *(1.0 if valid else 0.0 for valid in self.laser_valid_mask),
-            float(self.scan_age_s),
-            *self.ego_features,
-            *self.path_features,
-            *self.target_features,
-            *(1.0 if valid else 0.0 for valid in self.target_mask),
-            *self.safety_features,
-            *self.event_features,
-            float(self.pose_age_s),
-        )
-
-    def tensor(self) -> Tensor:
-        return torch.tensor(self.to_vector(), dtype=torch.float32)
 
 
 @dataclass(frozen=True)
@@ -166,20 +83,18 @@ class LocalWaypointObservationV3:
     schema_version: str = LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3
 
     def __post_init__(self) -> None:
-        laser = _as_tuple(self.laser_ranges)
+        laser = _float_tuple(self.laser_ranges)
         laser_mask = tuple(self.laser_valid_mask)
         safe_mask = tuple(self.safe_action_mask)
-        current = _as_tuple(self.current_waypoint_body_xy)
-        next_waypoint = _as_tuple(self.next_waypoint_body_xy)
+        current = _float_tuple(self.current_waypoint_body_xy)
+        next_waypoint = _float_tuple(self.next_waypoint_body_xy)
         object.__setattr__(self, "laser_ranges", laser)
         object.__setattr__(self, "laser_valid_mask", laser_mask)
         object.__setattr__(self, "safe_action_mask", safe_mask)
         object.__setattr__(self, "current_waypoint_body_xy", current)
         object.__setattr__(self, "next_waypoint_body_xy", next_waypoint)
         if len(laser) != LASER_COUNT or len(laser_mask) != LASER_COUNT:
-            raise ValueError(
-                "LocalWaypointObservationV3 requires 72 laser values and masks"
-            )
+            raise ValueError("observation requires 72 laser values and masks")
         if any(type(value) is not bool for value in laser_mask):
             raise ValueError("laser_valid_mask must contain booleans")
         if len(safe_mask) != ACTION_COUNT or any(
@@ -193,10 +108,10 @@ class LocalWaypointObservationV3:
         if type(self.hidden_reset) is not bool:
             raise ValueError("hidden_reset must be boolean")
         if self.schema_version != LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3:
-            raise ValueError("LocalWaypointObservationV3 schema is incompatible")
+            raise ValueError("observation schema is incompatible")
         if not isinstance(self.session_id, str) or not self.session_id.strip():
             raise ValueError("observation session is required")
-        values = (
+        numeric = (
             *laser,
             self.scan_age_s,
             self.pose_age_s,
@@ -214,8 +129,8 @@ class LocalWaypointObservationV3:
             self.map_clearance_m,
             self.stamp_sim,
         )
-        if not all(isfinite(float(value)) for value in values):
-            raise ValueError("LocalWaypointObservationV3 values must be finite")
+        if not all(isfinite(float(value)) for value in numeric):
+            raise ValueError("observation values must be finite")
         if min(self.scan_age_s, self.pose_age_s, self.device_age_s) < 0.0:
             raise ValueError("observation ages must be non-negative")
         if not 0.0 <= self.mission_progress <= 1.0:
@@ -227,10 +142,10 @@ class LocalWaypointObservationV3:
 
     @property
     def feature_dim(self) -> int:
-        return 166
+        return OBSERVATION_DIM
 
     def to_vector(self) -> tuple[float, ...]:
-        return (
+        vector = (
             *self.laser_ranges,
             *(1.0 if valid else 0.0 for valid in self.laser_valid_mask),
             float(self.scan_age_s),
@@ -250,16 +165,31 @@ class LocalWaypointObservationV3:
             float(self.map_clearance_m),
             *(1.0 if safe else 0.0 for safe in self.safe_action_mask),
         )
+        if len(vector) != OBSERVATION_DIM:
+            raise RuntimeError("observation dimension is inconsistent")
+        return vector
 
     def tensor(self) -> Tensor:
         return torch.tensor(self.to_vector(), dtype=torch.float32)
+
+    def to_payload(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "LocalWaypointObservationV3":
+        if not isinstance(payload, Mapping):
+            raise ValueError("observation payload is invalid")
+        try:
+            return cls(**dict(payload))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("observation payload is invalid") from exc
 
 
 @dataclass(frozen=True)
 class PolicyProposal:
     probabilities: tuple[float, ...]
     masked_probabilities: tuple[float, ...]
-    action: Optional[int]
+    action: int
     q1_values: tuple[float, ...]
     q2_values: tuple[float, ...]
     entropy: float
@@ -271,13 +201,14 @@ class PolicyProposal:
 
     @property
     def q_values(self) -> tuple[float, ...]:
-        return tuple(min(first, second) for first, second in zip(self.q1_values, self.q2_values))
+        return tuple(
+            min(first, second)
+            for first, second in zip(self.q1_values, self.q2_values)
+        )
 
 
 @dataclass(frozen=True)
 class RecurrentHiddenState:
-    """Separate recurrent streams for actor and the two critics."""
-
     actor: Optional[Tensor]
     critic1: Optional[Tensor]
     critic2: Optional[Tensor]
@@ -285,46 +216,83 @@ class RecurrentHiddenState:
 
 @dataclass(frozen=True)
 class SequenceTransition:
-    observation: LocalObservationV2
-    next_observation: LocalObservationV2
-    executed_action: Optional[int]
+    observation: LocalWaypointObservationV3
+    next_observation: LocalWaypointObservationV3
+    executed_action: int
     reward: float
     terminated: bool
-    timeout: bool
-    safety_truncation: bool
-    safe_action_mask: tuple[bool, ...]
-    hidden_reset: bool = False
-    next_safe_action_mask: Optional[tuple[bool, ...]] = None
+    truncated: bool
+    reason: str
+    operator_truncated: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.observation, LocalWaypointObservationV3) or not isinstance(
+            self.next_observation, LocalWaypointObservationV3
+        ):
+            raise ValueError("transition observations must use the V3 schema")
         if self.observation.session_id != self.next_observation.session_id:
             raise ValueError("a transition cannot cross sessions")
-        for name in ("terminated", "timeout", "safety_truncation", "hidden_reset"):
+        for name in ("terminated", "truncated", "operator_truncated"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
-        if self.terminated and self.timeout:
-            raise ValueError("terminated and timeout cannot both be true")
-        if self.executed_action is not None and not 0 <= self.executed_action < ACTION_COUNT:
-            raise ValueError("executed_action must be one of five actions or None")
-        if self.executed_action is None and not self.safety_truncation:
-            raise ValueError("a missing executed action must be a safety truncation")
-        safe_action_mask = tuple(self.safe_action_mask)
-        object.__setattr__(self, "safe_action_mask", safe_action_mask)
-        if len(safe_action_mask) != ACTION_COUNT or any(type(value) is not bool for value in safe_action_mask):
-            raise ValueError("safe_action_mask must contain five booleans")
-        if self.safety_truncation and self.executed_action is not None:
-            raise ValueError("safety truncation cannot carry an executed action")
-        if self.executed_action is not None and not safe_action_mask[self.executed_action]:
-            raise ValueError("executed_action must be allowed by safe_action_mask")
-        if self.next_safe_action_mask is not None:
-            next_safe_action_mask = tuple(self.next_safe_action_mask)
-            object.__setattr__(self, "next_safe_action_mask", next_safe_action_mask)
-            if len(next_safe_action_mask) != ACTION_COUNT or any(
-                type(value) is not bool for value in next_safe_action_mask
-            ):
-                raise ValueError("next_safe_action_mask must contain five booleans")
-        if not torch.isfinite(torch.tensor(self.reward, dtype=torch.float32)).item():
+        if self.terminated and self.truncated:
+            raise ValueError("terminated and truncated cannot both be true")
+        if self.operator_truncated and not self.truncated:
+            raise ValueError("operator_truncated requires truncated")
+        if isinstance(self.executed_action, bool) or not isinstance(
+            self.executed_action, int
+        ) or not 0 <= self.executed_action < ACTION_COUNT:
+            raise ValueError("executed_action must be one of five actions")
+        if not self.observation.safe_action_mask[self.executed_action]:
+            raise ValueError("executed_action must be safe in the observation")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("transition reason is required")
+        if not isfinite(float(self.reward)):
             raise ValueError("reward must be finite")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "observation": self.observation.to_payload(),
+            "next_observation": self.next_observation.to_payload(),
+            "executed_action": self.executed_action,
+            "reward": float(self.reward),
+            "terminated": self.terminated,
+            "truncated": self.truncated,
+            "reason": self.reason,
+            "operator_truncated": self.operator_truncated,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "SequenceTransition":
+        if not isinstance(payload, Mapping):
+            raise ValueError("transition payload is invalid")
+        required = {
+            "observation",
+            "next_observation",
+            "executed_action",
+            "reward",
+            "terminated",
+            "truncated",
+            "reason",
+            "operator_truncated",
+        }
+        if set(payload) != required:
+            raise ValueError("transition payload schema is incompatible")
+        try:
+            return cls(
+                observation=LocalWaypointObservationV3.from_payload(payload["observation"]),
+                next_observation=LocalWaypointObservationV3.from_payload(
+                    payload["next_observation"]
+                ),
+                executed_action=payload["executed_action"],
+                reward=float(payload["reward"]),
+                terminated=payload["terminated"],
+                truncated=payload["truncated"],
+                reason=payload["reason"],
+                operator_truncated=payload["operator_truncated"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("transition payload is invalid") from exc
 
 
 @dataclass
@@ -334,8 +302,7 @@ class ReplaySequenceBatch:
     actions: Tensor
     rewards: Tensor
     terminated: Tensor
-    timeout: Tensor
-    safety_truncation: Tensor
+    truncated: Tensor
     safe_action_mask: Tensor
     next_safe_action_mask: Tensor
     learning_mask: Tensor
@@ -355,16 +322,17 @@ class ReplaySequenceBatch:
 
 
 class SequenceReplay:
-    """Episode-aware replay that never samples across a session boundary."""
+    """Episode-aware V3 replay that never crosses a session boundary."""
 
     def __init__(self, capacity: int = 1024, seed: int = 0) -> None:
-        if not isinstance(capacity, int) or capacity <= 0:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("capacity must be positive")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
         self.capacity = capacity
         self._rng = Random(seed)
         self._episodes: list[tuple[SequenceTransition, ...]] = []
         self._next_episode_id = 0
-        self.observation_dim: Optional[int] = None
 
     def __len__(self) -> int:
         return len(self._episodes)
@@ -373,73 +341,82 @@ class SequenceReplay:
         episode = tuple(transitions)
         if not episode:
             raise ValueError("episode must contain at least one transition")
+        if any(not isinstance(item, SequenceTransition) for item in episode):
+            raise ValueError("episode contains an invalid transition")
         session = episode[0].observation.session_id
-        dimension = episode[0].observation.feature_dim
-        if any(
-            transition.observation.session_id != session
-            or transition.next_observation.session_id != session
-            or transition.observation.feature_dim != dimension
-            or transition.next_observation.feature_dim != dimension
-            for transition in episode
-        ):
-            raise ValueError("episode observations must share session and schema")
-        if self.observation_dim is None:
-            self.observation_dim = dimension
-        if self.observation_dim != dimension:
-            raise ValueError("replay observation dimensions cannot change")
+        if any(item.observation.session_id != session for item in episode):
+            raise ValueError("episode transitions must share a session")
         for index, transition in enumerate(episode):
-            if (transition.terminated or transition.timeout or transition.safety_truncation) and index != len(episode) - 1:
-                raise ValueError("terminal or safety boundary must be the last transition")
+            boundary = transition.terminated or transition.truncated
+            if boundary != (index == len(episode) - 1):
+                raise ValueError("the episode boundary must be the final transition")
         self._episodes.append(episode)
         self._next_episode_id += 1
         if len(self._episodes) > self.capacity:
             self._episodes.pop(0)
 
     def state_dict(self) -> dict[str, object]:
-        """Return the complete replay state needed for an exact resume."""
         return {
+            "schema_version": REPLAY_SCHEMA_V3,
             "capacity": self.capacity,
             "rng_state": deepcopy(self._rng.getstate()),
-            "episodes": deepcopy(tuple(self._episodes)),
+            "episodes": [
+                [transition.to_payload() for transition in episode]
+                for episode in self._episodes
+            ],
             "next_episode_id": self._next_episode_id,
-            "observation_dim": self.observation_dim,
         }
 
     @classmethod
-    def from_state_dict(cls, state: dict[str, object]) -> "SequenceReplay":
-        if not isinstance(state, dict):
-            raise ValueError("replay state must be a dictionary")
+    def from_state_dict(cls, state: Mapping[str, object]) -> "SequenceReplay":
+        required = {
+            "schema_version",
+            "capacity",
+            "rng_state",
+            "episodes",
+            "next_episode_id",
+        }
+        if not isinstance(state, Mapping) or set(state) != required:
+            raise ValueError("replay state schema is incompatible")
+        if state.get("schema_version") != REPLAY_SCHEMA_V3:
+            raise ValueError("only national-test-replay-v3 is supported")
         capacity = state.get("capacity")
-        if not isinstance(capacity, int) or capacity <= 0:
-            raise ValueError("replay capacity is invalid")
         episodes = state.get("episodes")
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("replay capacity is invalid")
         if not isinstance(episodes, (list, tuple)) or len(episodes) > capacity:
             raise ValueError("replay episodes are invalid")
         replay = cls(capacity=capacity)
-        for episode in episodes:
-            if not isinstance(episode, (list, tuple)):
+        for raw_episode in episodes:
+            if not isinstance(raw_episode, (list, tuple)):
                 raise ValueError("replay episode is invalid")
-            replay.add_episode(episode)
-        next_episode_id = state.get("next_episode_id")
-        if not isinstance(next_episode_id, int) or next_episode_id < len(episodes):
+            replay.add_episode(
+                tuple(SequenceTransition.from_payload(item) for item in raw_episode)
+            )
+        counter = state.get("next_episode_id")
+        if isinstance(counter, bool) or not isinstance(counter, int) or counter < len(episodes):
             raise ValueError("replay episode counter is invalid")
-        replay._next_episode_id = next_episode_id
-        if replay.observation_dim != state.get("observation_dim"):
-            raise ValueError("replay observation dimension is invalid")
+        replay._next_episode_id = counter
         try:
             replay._rng.setstate(state["rng_state"])
-        except (KeyError, TypeError, ValueError) as exc:
+        except (TypeError, ValueError) as exc:
             raise ValueError("replay random state is invalid") from exc
         return replay
 
     def sample(self, batch_size: int, burn_in: int, unroll: int) -> ReplaySequenceBatch:
         if not self._episodes:
             raise ValueError("replay is empty")
-        if not isinstance(batch_size, int) or batch_size <= 0:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if not isinstance(burn_in, int) or burn_in < 0 or not isinstance(unroll, int) or unroll <= 0:
+        if (
+            isinstance(burn_in, bool)
+            or not isinstance(burn_in, int)
+            or burn_in < 0
+            or isinstance(unroll, bool)
+            or not isinstance(unroll, int)
+            or unroll <= 0
+        ):
             raise ValueError("burn_in must be non-negative and unroll positive")
-        assert self.observation_dim is not None
         total = burn_in + unroll
         rows: list[dict[str, object]] = []
         for _ in range(batch_size):
@@ -452,8 +429,7 @@ class SequenceReplay:
                 "actions": [],
                 "rewards": [],
                 "terminated": [],
-                "timeout": [],
-                "safety": [],
+                "truncated": [],
                 "safe": [],
                 "next_safe": [],
                 "learning": [],
@@ -466,13 +442,12 @@ class SequenceReplay:
             for offset in range(total):
                 index = start + offset
                 if index >= len(episode):
-                    row["obs"].append((0.0,) * self.observation_dim)
-                    row["next_obs"].append((0.0,) * self.observation_dim)
-                    row["actions"].append(-1)
+                    row["obs"].append((0.0,) * OBSERVATION_DIM)
+                    row["next_obs"].append((0.0,) * OBSERVATION_DIM)
+                    row["actions"].append(0)
                     row["rewards"].append(0.0)
                     row["terminated"].append(True)
-                    row["timeout"].append(False)
-                    row["safety"].append(False)
+                    row["truncated"].append(False)
                     row["safe"].append((False,) * ACTION_COUNT)
                     row["next_safe"].append((False,) * ACTION_COUNT)
                     row["learning"].append(0.0)
@@ -481,26 +456,18 @@ class SequenceReplay:
                     row["next_reset"].append(True)
                     continue
                 transition = episode[index]
-                next_safe = transition.next_safe_action_mask
-                if next_safe is None:
-                    next_safe = (
-                        episode[index + 1].safe_action_mask
-                        if index + 1 < len(episode)
-                        else (False,) * ACTION_COUNT
-                    )
                 row["obs"].append(transition.observation.to_vector())
                 row["next_obs"].append(transition.next_observation.to_vector())
-                row["actions"].append(-1 if transition.executed_action is None else transition.executed_action)
+                row["actions"].append(transition.executed_action)
                 row["rewards"].append(float(transition.reward))
-                row["terminated"].append(bool(transition.terminated))
-                row["timeout"].append(bool(transition.timeout))
-                row["safety"].append(bool(transition.safety_truncation))
-                row["safe"].append(transition.safe_action_mask)
-                row["next_safe"].append(next_safe)
+                row["terminated"].append(transition.terminated)
+                row["truncated"].append(transition.truncated)
+                row["safe"].append(transition.observation.safe_action_mask)
+                row["next_safe"].append(transition.next_observation.safe_action_mask)
                 row["learning"].append(0.0 if offset < burn_in else 1.0)
                 row["padding"].append(False)
-                row["reset"].append(bool(transition.hidden_reset or index == 0))
-                row["next_reset"].append(bool(transition.next_observation.hidden_reset))
+                row["reset"].append(transition.observation.hidden_reset or index == 0)
+                row["next_reset"].append(transition.next_observation.hidden_reset)
             rows.append(row)
 
         def stack(name: str, dtype: torch.dtype) -> Tensor:
@@ -512,8 +479,7 @@ class SequenceReplay:
             actions=stack("actions", torch.long),
             rewards=stack("rewards", torch.float32),
             terminated=stack("terminated", torch.bool),
-            timeout=stack("timeout", torch.bool),
-            safety_truncation=stack("safety", torch.bool),
+            truncated=stack("truncated", torch.bool),
             safe_action_mask=stack("safe", torch.bool),
             next_safe_action_mask=stack("next_safe", torch.bool),
             learning_mask=stack("learning", torch.float32),
@@ -526,61 +492,21 @@ class SequenceReplay:
 
 
 class _RecurrentHead(nn.Module):
-    def __init__(self, observation_dim: int, hidden_dim: int, output_dim: int) -> None:
+    def __init__(self, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
-        self.gru = nn.GRU(observation_dim, hidden_dim, batch_first=True)
+        self.gru = nn.GRU(OBSERVATION_DIM, hidden_dim, batch_first=True)
         self.head = nn.Linear(hidden_dim, output_dim)
 
-    def encode(
-        self,
-        observations: Tensor,
-        reset_mask: Optional[Tensor] = None,
-        hidden: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor]:
-        if reset_mask is None:
-            return self.gru(observations, hidden)
-        outputs: list[Tensor] = []
-        current_hidden = hidden
-        for index in range(observations.shape[1]):
-            if current_hidden is not None:
-                reset = reset_mask[:, index].to(dtype=observations.dtype).view(1, -1, 1)
-                current_hidden = current_hidden * (1.0 - reset)
-            output, current_hidden = self.gru(
-                observations[:, index : index + 1], current_hidden
-            )
-            outputs.append(output)
-        return torch.cat(outputs, dim=1), current_hidden
-
-    def encode_with_history(
-        self,
-        observations: Tensor,
-        reset_mask: Optional[Tensor] = None,
-        hidden: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Encode a sequence and retain the post-observation hidden state at each step."""
-        if observations.ndim != 3:
-            raise ValueError("observations must have shape [batch, time, features]")
-        if reset_mask is None:
-            reset_mask = torch.zeros(
-                observations.shape[:2], dtype=torch.bool, device=observations.device
-            )
-        if reset_mask.shape != observations.shape[:2]:
-            raise ValueError("reset_mask must match the batch and time dimensions")
-        outputs: list[Tensor] = []
-        history: list[Tensor] = []
-        current_hidden = hidden
-        for index in range(observations.shape[1]):
-            if current_hidden is not None:
-                reset = reset_mask[:, index].to(dtype=observations.dtype).view(1, -1, 1)
-                current_hidden = current_hidden * (1.0 - reset)
-            output, current_hidden = self.gru(
-                observations[:, index : index + 1], current_hidden
-            )
-            outputs.append(output)
-            history.append(current_hidden[0].unsqueeze(1))
-        if not outputs:
-            raise ValueError("observations must contain at least one time step")
-        return torch.cat(outputs, dim=1), current_hidden, torch.cat(history, dim=1)
+    @staticmethod
+    def _reset_hidden(
+        hidden: Optional[Tensor],
+        reset_mask: Tensor,
+        dtype: torch.dtype,
+    ) -> Optional[Tensor]:
+        if hidden is None:
+            return None
+        reset = reset_mask.to(dtype=dtype).view(1, -1, 1)
+        return hidden * (1.0 - reset)
 
     def forward(
         self,
@@ -588,95 +514,135 @@ class _RecurrentHead(nn.Module):
         reset_mask: Optional[Tensor] = None,
         hidden: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
-        encoded, output_hidden = self.encode(observations, reset_mask, hidden)
-        return self.head(encoded), output_hidden
+        if observations.ndim != 3 or observations.shape[-1] != OBSERVATION_DIM:
+            raise ValueError("observations must have shape [batch, time, 166]")
+        if reset_mask is None:
+            encoded, output_hidden = self.gru(observations, hidden)
+            return self.head(encoded), output_hidden
+        if reset_mask.shape != observations.shape[:2]:
+            raise ValueError("reset_mask must match batch and time")
+        outputs: list[Tensor] = []
+        current_hidden = hidden
+        for index in range(observations.shape[1]):
+            current_hidden = self._reset_hidden(
+                current_hidden,
+                reset_mask[:, index],
+                observations.dtype,
+            )
+            encoded, current_hidden = self.gru(
+                observations[:, index : index + 1], current_hidden
+            )
+            outputs.append(self.head(encoded))
+        if not outputs:
+            raise ValueError("observations must contain a time step")
+        return torch.cat(outputs, dim=1), current_hidden
 
     def forward_with_history(
         self,
         observations: Tensor,
-        reset_mask: Optional[Tensor] = None,
-        hidden: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        encoded, output_hidden, history = self.encode_with_history(observations, reset_mask, hidden)
-        return self.head(encoded), output_hidden, history
+        reset_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if observations.ndim != 3 or reset_mask.shape != observations.shape[:2]:
+            raise ValueError("sequence shapes are incompatible")
+        outputs: list[Tensor] = []
+        history: list[Tensor] = []
+        hidden: Optional[Tensor] = None
+        for index in range(observations.shape[1]):
+            hidden = self._reset_hidden(hidden, reset_mask[:, index], observations.dtype)
+            encoded, hidden = self.gru(observations[:, index : index + 1], hidden)
+            outputs.append(self.head(encoded))
+            history.append(hidden[0].unsqueeze(1))
+        if not outputs:
+            raise ValueError("observations must contain a time step")
+        return torch.cat(outputs, dim=1), torch.cat(history, dim=1)
 
     def advance_from_history(
         self,
         observations: Tensor,
         history: Tensor,
-        reset_mask: Optional[Tensor] = None,
+        reset_mask: Tensor,
     ) -> Tensor:
-        """Evaluate each next observation from the hidden state after its current observation."""
-        if observations.ndim != 3 or history.ndim != 3:
-            raise ValueError("observations and history must be rank-three tensors")
-        if observations.shape[0] != history.shape[0] or observations.shape[1] != history.shape[1]:
-            raise ValueError("history must match the batch and time dimensions")
-        if reset_mask is not None and reset_mask.shape != observations.shape[:2]:
-            raise ValueError("reset_mask must match the batch and time dimensions")
+        if (
+            observations.ndim != 3
+            or history.ndim != 3
+            or observations.shape[:2] != history.shape[:2]
+            or reset_mask.shape != observations.shape[:2]
+        ):
+            raise ValueError("next-observation history shapes are incompatible")
         outputs: list[Tensor] = []
         for index in range(observations.shape[1]):
-            current_history = history[:, index : index + 1].transpose(0, 1)
-            if reset_mask is not None:
-                reset = reset_mask[:, index].to(dtype=observations.dtype).view(1, -1, 1)
-                current_history = current_history * (1.0 - reset)
-            encoded, _ = self.gru(
-                observations[:, index : index + 1], current_history
-            )
+            hidden = history[:, index : index + 1].transpose(0, 1)
+            hidden = self._reset_hidden(hidden, reset_mask[:, index], observations.dtype)
+            encoded, _ = self.gru(observations[:, index : index + 1], hidden)
             outputs.append(self.head(encoded))
         if not outputs:
-            raise ValueError("observations must contain at least one time step")
+            raise ValueError("observations must contain a time step")
         return torch.cat(outputs, dim=1)
 
 
 class RecurrentDiscreteSAC:
-    """Twin-Q discrete SAC with GRU history and exact masked expectations."""
+    """Twin-Q discrete SAC with GRU history and exact safety masking."""
 
-    action_schema = "five-discrete-forward-bias-v2"
+    observation_dim = OBSERVATION_DIM
+    action_dim = ACTION_COUNT
+    observation_schema = LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3
+    action_schema = ACTION_SCHEMA
 
     def __init__(
         self,
-        observation_dim: int,
         *,
-        action_dim: int = ACTION_COUNT,
         hidden_dim: int = 64,
         gamma: float = 0.99,
         tau: float = 0.005,
         alpha_init: float = 0.2,
         learning_rate: float = 3e-4,
         seed: int = 0,
-        observation_schema: str = "local-observation-v2-reduced",
     ) -> None:
-        if not isinstance(observation_dim, int) or observation_dim <= 0:
-            raise ValueError("observation_dim must be positive")
-        if action_dim != ACTION_COUNT:
-            raise ValueError("the first version requires exactly five actions")
-        if not isinstance(hidden_dim, int) or hidden_dim <= 0:
+        if isinstance(hidden_dim, bool) or not isinstance(hidden_dim, int) or hidden_dim <= 0:
             raise ValueError("hidden_dim must be positive")
-        if not all(torch.isfinite(torch.tensor(value, dtype=torch.float32)).item() for value in (gamma, tau, alpha_init, learning_rate)):
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
+        values = (gamma, tau, alpha_init, learning_rate)
+        if not all(isfinite(float(value)) for value in values):
             raise ValueError("SAC configuration must be finite")
-        if not 0.0 < gamma <= 1.0 or not 0.0 < tau <= 1.0 or alpha_init <= 0.0 or learning_rate <= 0.0:
+        if (
+            not 0.0 < gamma <= 1.0
+            or not 0.0 < tau <= 1.0
+            or alpha_init <= 0.0
+            or learning_rate <= 0.0
+        ):
             raise ValueError("SAC configuration is outside bounds")
         torch.manual_seed(seed)
-        self.observation_dim = observation_dim
-        self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.gamma = float(gamma)
         self.tau = float(tau)
-        self.observation_schema = observation_schema
-        self.actor = _RecurrentHead(observation_dim, hidden_dim, action_dim)
-        self.critic1 = _RecurrentHead(observation_dim, hidden_dim, action_dim)
-        self.critic2 = _RecurrentHead(observation_dim, hidden_dim, action_dim)
-        self.target_critic1 = _RecurrentHead(observation_dim, hidden_dim, action_dim)
-        self.target_critic2 = _RecurrentHead(observation_dim, hidden_dim, action_dim)
+        self.actor = _RecurrentHead(hidden_dim, ACTION_COUNT)
+        self.critic1 = _RecurrentHead(hidden_dim, ACTION_COUNT)
+        self.critic2 = _RecurrentHead(hidden_dim, ACTION_COUNT)
+        self.target_critic1 = _RecurrentHead(hidden_dim, ACTION_COUNT)
+        self.target_critic2 = _RecurrentHead(hidden_dim, ACTION_COUNT)
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
-        for parameter in (*self.target_critic1.parameters(), *self.target_critic2.parameters()):
+        for parameter in (
+            *self.target_critic1.parameters(),
+            *self.target_critic2.parameters(),
+        ):
             parameter.requires_grad_(False)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=learning_rate)
-        self.critic1_optimizer = torch.optim.Adam(self.critic1.parameters(), lr=learning_rate)
-        self.critic2_optimizer = torch.optim.Adam(self.critic2.parameters(), lr=learning_rate)
-        self.log_alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32).log())
-        self.alpha_optimizer = torch.optim.Adam((self.log_alpha,), lr=learning_rate)
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(), lr=learning_rate
+        )
+        self.critic1_optimizer = torch.optim.Adam(
+            self.critic1.parameters(), lr=learning_rate
+        )
+        self.critic2_optimizer = torch.optim.Adam(
+            self.critic2.parameters(), lr=learning_rate
+        )
+        self.log_alpha = nn.Parameter(
+            torch.tensor(alpha_init, dtype=torch.float32).log()
+        )
+        self.alpha_optimizer = torch.optim.Adam(
+            (self.log_alpha,), lr=learning_rate
+        )
         self.training_step = 0
 
     def parameters(self) -> Iterable[Tensor]:
@@ -691,46 +657,26 @@ class RecurrentDiscreteSAC:
     def alpha(self) -> Tensor:
         return self.log_alpha.exp().clamp(1e-6, 100.0)
 
-    def _validate_batch(self, batch: ReplaySequenceBatch) -> None:
-        if not isinstance(batch, ReplaySequenceBatch):
-            raise ValueError("batch type is invalid")
-        if batch.observation_dim != self.observation_dim or batch.action_dim != self.action_dim:
-            raise ValueError("batch schema dimensions do not match SAC")
-        for name in (
-            "observations",
-            "next_observations",
-            "rewards",
-            "learning_mask",
-        ):
-            _finite_tensor(getattr(batch, name), name)
-        if batch.actions.dtype != torch.long:
-            raise ValueError("actions must be integer encoded")
-        if torch.any((batch.actions < -1) | (batch.actions >= self.action_dim)).item():
-            raise ValueError("actions contain an invalid value")
-        for name in (
-            "terminated",
-            "timeout",
-            "safety_truncation",
-            "safe_action_mask",
-            "next_safe_action_mask",
-            "padding_mask",
-            "hidden_reset",
-            "next_hidden_reset",
-        ):
-            if getattr(batch, name).dtype != torch.bool:
-                raise ValueError(f"{name} must be boolean")
-
     @staticmethod
-    def _masked_distribution(logits: Tensor, action_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def _masked_distribution(
+        logits: Tensor,
+        action_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
         if logits.shape != action_mask.shape:
             raise ValueError("logits and action mask must have the same shape")
         mask = action_mask.to(dtype=torch.bool)
         has_safe = mask.any(dim=-1)
-        safe_logits = logits.masked_fill(~mask, -1e9)
+        safe_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
         probabilities = torch.softmax(safe_logits, dim=-1)
         probabilities = probabilities * mask.to(dtype=probabilities.dtype)
-        probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        probabilities = torch.where(has_safe.unsqueeze(-1), probabilities, torch.zeros_like(probabilities))
+        probabilities = probabilities / probabilities.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-12)
+        probabilities = torch.where(
+            has_safe.unsqueeze(-1),
+            probabilities,
+            torch.zeros_like(probabilities),
+        )
         log_probabilities = torch.where(
             probabilities > 0.0,
             torch.log(probabilities.clamp_min(1e-12)),
@@ -740,74 +686,58 @@ class RecurrentDiscreteSAC:
 
     def act(
         self,
-        observation: LocalObservationV2,
+        observation: LocalWaypointObservationV3,
         safe_action_mask: Sequence[bool],
         *,
-        hidden: Optional[Tensor | RecurrentHiddenState] = None,
+        hidden: Optional[RecurrentHiddenState] = None,
         deterministic: bool = False,
     ) -> tuple[PolicyProposal, RecurrentHiddenState]:
         started = perf_counter()
-        if not isinstance(observation, LocalObservationV2) or observation.schema_version != self.observation_schema:
+        if not isinstance(observation, LocalWaypointObservationV3):
             raise ValueError("observation schema is incompatible with SAC")
-        vector = observation.tensor()
-        if vector.numel() != self.observation_dim:
-            raise ValueError("observation dimension is incompatible with SAC")
-        try:
-            mask_values = tuple(safe_action_mask)
-        except TypeError as exc:
-            raise ValueError("safe_action_mask must contain booleans") from exc
-        if len(mask_values) != self.action_dim:
-            raise ValueError("safe_action_mask must contain five actions")
-        if any(type(value) is not bool for value in mask_values):
-            raise ValueError("safe_action_mask must contain booleans")
+        if type(deterministic) is not bool:
+            raise ValueError("deterministic must be boolean")
+        mask_values = tuple(safe_action_mask)
+        if len(mask_values) != ACTION_COUNT or any(
+            type(value) is not bool for value in mask_values
+        ):
+            raise ValueError("safe_action_mask must contain five booleans")
+        if not any(mask_values):
+            raise ValueError("policy requires at least one safe action")
+        if hidden is not None and not isinstance(hidden, RecurrentHiddenState):
+            raise ValueError("hidden state type is incompatible")
+        recurrent = hidden or RecurrentHiddenState(None, None, None)
+        vector = observation.tensor().view(1, 1, -1)
         mask = torch.tensor(mask_values, dtype=torch.bool).view(1, 1, -1)
-        input_id = f"{observation.session_id}:{observation.stamp_sim:.6f}"
         reset = torch.tensor([[observation.hidden_reset]], dtype=torch.bool)
-        if hidden is None:
-            recurrent_hidden = RecurrentHiddenState(None, None, None)
-        elif isinstance(hidden, RecurrentHiddenState):
-            recurrent_hidden = hidden
-        elif isinstance(hidden, Tensor):
-            # Accept the pre-v1 tensor form for callers upgrading in place;
-            # returned state is always split into three explicit streams.
-            recurrent_hidden = RecurrentHiddenState(hidden, hidden, hidden)
-        else:
-            raise ValueError("hidden must be a tensor or RecurrentHiddenState")
-        logits, actor_hidden = self.actor(vector.view(1, 1, -1), reset, recurrent_hidden.actor)
-        q1, critic1_hidden = self.critic1(
-            vector.view(1, 1, -1), reset, recurrent_hidden.critic1
-        )
-        q2, critic2_hidden = self.critic2(
-            vector.view(1, 1, -1), reset, recurrent_hidden.critic2
-        )
-        probabilities = torch.softmax(logits[:, -1], dim=-1)
-        masked, log_probs, has_safe = self._masked_distribution(logits[:, -1:], mask)
-        masked = masked[:, 0]
-        log_probs = log_probs[:, 0]
-        action: Optional[int]
-        if not has_safe[0].item():
-            action = None
-            entropy = 0.0
-        elif deterministic:
-            action = int(torch.argmax(masked[0]).item())
+        with torch.inference_mode():
+            logits, actor_hidden = self.actor(vector, reset, recurrent.actor)
+            q1, critic1_hidden = self.critic1(vector, reset, recurrent.critic1)
+            q2, critic2_hidden = self.critic2(vector, reset, recurrent.critic2)
+            probabilities = torch.softmax(logits[:, -1], dim=-1)
+            masked, log_probs, _ = self._masked_distribution(logits, mask)
+            masked = masked[:, -1]
+            log_probs = log_probs[:, -1]
+            if deterministic:
+                action = int(torch.argmax(masked[0]).item())
+            else:
+                action = int(torch.multinomial(masked[0], 1).item())
             entropy = float(-(masked[0] * log_probs[0]).sum().item())
-        else:
-            action = int(torch.multinomial(masked[0], 1).item())
-            entropy = float(-(masked[0] * log_probs[0]).sum().item())
-        _finite_tensor(probabilities, "policy probabilities")
-        _finite_tensor(q1, "q1")
-        _finite_tensor(q2, "q2")
+            _finite_tensor(probabilities, "policy probabilities")
+            _finite_tensor(q1, "q1")
+            _finite_tensor(q2, "q2")
+        input_id = f"{observation.session_id}:{observation.stamp_sim:.6f}"
         return (
             PolicyProposal(
-                probabilities=tuple(float(value) for value in probabilities[0].detach()),
-                masked_probabilities=tuple(float(value) for value in masked[0].detach()),
+                probabilities=tuple(float(value) for value in probabilities[0]),
+                masked_probabilities=tuple(float(value) for value in masked[0]),
                 action=action,
-                q1_values=tuple(float(value) for value in q1[0, -1].detach()),
-                q2_values=tuple(float(value) for value in q2[0, -1].detach()),
+                q1_values=tuple(float(value) for value in q1[0, -1]),
+                q2_values=tuple(float(value) for value in q2[0, -1]),
                 entropy=entropy,
                 hidden_state_input_id=input_id,
                 hidden_state_output_id=f"{input_id}:next",
-                observation_schema=observation.schema_version,
+                observation_schema=self.observation_schema,
                 action_schema=self.action_schema,
                 inference_ms=(perf_counter() - started) * 1000.0,
             ),
@@ -818,23 +748,65 @@ class RecurrentDiscreteSAC:
             ),
         )
 
+    def _validate_batch(self, batch: ReplaySequenceBatch) -> None:
+        if not isinstance(batch, ReplaySequenceBatch):
+            raise ValueError("batch type is invalid")
+        if batch.observation_dim != OBSERVATION_DIM or batch.action_dim != ACTION_COUNT:
+            raise ValueError("batch dimensions do not match SAC")
+        shape = batch.observations.shape[:2]
+        if batch.next_observations.shape != batch.observations.shape:
+            raise ValueError("next observation shape is invalid")
+        for name in (
+            "actions",
+            "rewards",
+            "terminated",
+            "truncated",
+            "learning_mask",
+            "padding_mask",
+            "hidden_reset",
+            "next_hidden_reset",
+        ):
+            if getattr(batch, name).shape != shape:
+                raise ValueError(f"{name} shape is invalid")
+        for name in ("safe_action_mask", "next_safe_action_mask"):
+            if getattr(batch, name).shape != (*shape, ACTION_COUNT):
+                raise ValueError(f"{name} shape is invalid")
+        for name in ("observations", "next_observations", "rewards", "learning_mask"):
+            _finite_tensor(getattr(batch, name), name)
+        if batch.actions.dtype != torch.long or torch.any(
+            (batch.actions < 0) | (batch.actions >= ACTION_COUNT)
+        ).item():
+            raise ValueError("actions are invalid")
+        for name in (
+            "terminated",
+            "truncated",
+            "safe_action_mask",
+            "next_safe_action_mask",
+            "padding_mask",
+            "hidden_reset",
+            "next_hidden_reset",
+        ):
+            if getattr(batch, name).dtype != torch.bool:
+                raise ValueError(f"{name} must be boolean")
+        if torch.any(batch.terminated & batch.truncated).item():
+            raise ValueError("a sample cannot be terminated and truncated")
+
     def update(self, batch: ReplaySequenceBatch) -> dict[str, float | bool | int]:
         self._validate_batch(batch)
-        _finite_modules((self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2), "parameters")
+        modules = (
+            self.actor,
+            self.critic1,
+            self.critic2,
+            self.target_critic1,
+            self.target_critic2,
+        )
+        _finite_modules(modules)
         learning = batch.learning_mask > 0.0
-        usable_action = batch.actions >= 0
         current_has_safe = batch.safe_action_mask.any(dim=-1)
         action_is_safe = batch.safe_action_mask.gather(
-            -1, batch.actions.clamp_min(0).unsqueeze(-1)
+            -1, batch.actions.unsqueeze(-1)
         ).squeeze(-1)
-        critic_mask = (
-            learning
-            & ~batch.padding_mask
-            & usable_action
-            & action_is_safe
-            & current_has_safe
-            & ~batch.safety_truncation
-        )
+        critic_mask = learning & ~batch.padding_mask & current_has_safe & action_is_safe
         if not critic_mask.any().item():
             return {
                 "updated": False,
@@ -842,18 +814,23 @@ class RecurrentDiscreteSAC:
                 "critic_samples": 0,
                 "bootstrap_count": 0,
             }
-        reset = batch.hidden_reset
-        logits, _, actor_history = self.actor.forward_with_history(batch.observations, reset)
-        q1, _ = self.critic1(batch.observations, reset)
-        q2, _ = self.critic2(batch.observations, reset)
+        logits, actor_history = self.actor.forward_with_history(
+            batch.observations, batch.hidden_reset
+        )
+        q1, _ = self.critic1(batch.observations, batch.hidden_reset)
+        q2, _ = self.critic2(batch.observations, batch.hidden_reset)
         with torch.no_grad():
             next_logits = self.actor.advance_from_history(
                 batch.next_observations,
                 actor_history,
                 batch.next_hidden_reset,
             )
-            _, _, target1_history = self.target_critic1.forward_with_history(batch.observations, reset)
-            _, _, target2_history = self.target_critic2.forward_with_history(batch.observations, reset)
+            _, target1_history = self.target_critic1.forward_with_history(
+                batch.observations, batch.hidden_reset
+            )
+            _, target2_history = self.target_critic2.forward_with_history(
+                batch.observations, batch.hidden_reset
+            )
             next_q1 = self.target_critic1.advance_from_history(
                 batch.next_observations,
                 target1_history,
@@ -864,45 +841,42 @@ class RecurrentDiscreteSAC:
                 target2_history,
                 batch.next_hidden_reset,
             )
-        current_prob, current_log_prob, current_has_safe = self._masked_distribution(
+        current_prob, current_log_prob, _ = self._masked_distribution(
             logits, batch.safe_action_mask
         )
         next_prob, next_log_prob, next_has_safe = self._masked_distribution(
             next_logits, batch.next_safe_action_mask
         )
-        q1_taken = q1.gather(-1, batch.actions.clamp_min(0).unsqueeze(-1)).squeeze(-1)
-        q2_taken = q2.gather(-1, batch.actions.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+        q1_taken = q1.gather(-1, batch.actions.unsqueeze(-1)).squeeze(-1)
+        q2_taken = q2.gather(-1, batch.actions.unsqueeze(-1)).squeeze(-1)
         with torch.no_grad():
             next_min_q = torch.minimum(next_q1, next_q2)
-            next_value = (next_prob * (next_min_q - self.alpha.detach() * next_log_prob)).sum(dim=-1)
-            bootstrap = (
-                ~batch.terminated
-                & ~batch.safety_truncation
-                & ~batch.padding_mask
-                & next_has_safe
-            )
+            next_value = (
+                next_prob * (next_min_q - self.alpha.detach() * next_log_prob)
+            ).sum(dim=-1)
+            bootstrap = ~batch.terminated & ~batch.padding_mask & next_has_safe
             target = batch.rewards + self.gamma * bootstrap.to(torch.float32) * next_value
-        target = target.detach()
-        critic_loss = F.mse_loss(q1_taken[critic_mask], target[critic_mask]) + F.mse_loss(
-            q2_taken[critic_mask], target[critic_mask]
-        )
-        actor_mask = learning & ~batch.padding_mask & current_has_safe & ~batch.safety_truncation
-        if actor_mask.any().item():
-            current_min_q = torch.minimum(q1, q2).detach()
-            actor_terms = (current_prob * (self.alpha.detach() * current_log_prob - current_min_q)).sum(dim=-1)
-            actor_loss = actor_terms[actor_mask].mean()
-            entropy = -(current_prob * current_log_prob).sum(dim=-1)[actor_mask].mean()
-            safe_count = batch.safe_action_mask.to(torch.float32).sum(dim=-1).clamp_min(1.0)
-            desired_entropy = (0.5 * torch.log(safe_count))[actor_mask].mean().detach()
-            alpha_loss = -(self.log_alpha * (entropy.detach() - desired_entropy))
-        else:
-            actor_loss = torch.zeros((), dtype=torch.float32)
-            entropy = torch.zeros((), dtype=torch.float32)
-            alpha_loss = torch.zeros((), dtype=torch.float32)
-        for loss, name in ((critic_loss, "critic_loss"), (actor_loss, "actor_loss"), (alpha_loss, "alpha_loss")):
+        critic_loss = F.mse_loss(
+            q1_taken[critic_mask], target[critic_mask]
+        ) + F.mse_loss(q2_taken[critic_mask], target[critic_mask])
+        actor_mask = learning & ~batch.padding_mask & current_has_safe
+        current_min_q = torch.minimum(q1, q2).detach()
+        actor_terms = (
+            current_prob * (self.alpha.detach() * current_log_prob - current_min_q)
+        ).sum(dim=-1)
+        actor_loss = actor_terms[actor_mask].mean()
+        entropy = -(current_prob * current_log_prob).sum(dim=-1)[actor_mask].mean()
+        safe_count = batch.safe_action_mask.to(torch.float32).sum(dim=-1).clamp_min(1.0)
+        desired_entropy = (0.5 * torch.log(safe_count))[actor_mask].mean().detach()
+        alpha_loss = -(self.log_alpha * (entropy.detach() - desired_entropy))
+        for loss, name in (
+            (critic_loss, "critic_loss"),
+            (actor_loss, "actor_loss"),
+            (alpha_loss, "alpha_loss"),
+        ):
             _finite_tensor(loss.detach(), name)
 
-        before_update = self._snapshot_training_state()
+        before = self._snapshot_training_state()
         try:
             self.critic1_optimizer.zero_grad(set_to_none=True)
             self.critic2_optimizer.zero_grad(set_to_none=True)
@@ -910,23 +884,21 @@ class RecurrentDiscreteSAC:
             self._finite_gradients((self.critic1, self.critic2), "critic gradients")
             self.critic1_optimizer.step()
             self.critic2_optimizer.step()
-
-            if actor_mask.any().item():
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                actor_loss.backward()
-                self._finite_gradients((self.actor,), "actor gradients")
-                self.actor_optimizer.step()
-                self.alpha_optimizer.zero_grad(set_to_none=True)
-                alpha_loss.backward()
-                self._finite_gradients((self,), "temperature gradients")
-                self.alpha_optimizer.step()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            actor_loss.backward()
+            self._finite_gradients((self.actor,), "actor gradients")
+            self.actor_optimizer.step()
+            self.alpha_optimizer.zero_grad(set_to_none=True)
+            alpha_loss.backward()
+            self._finite_gradients((self,), "temperature gradients")
+            self.alpha_optimizer.step()
             self._soft_update(self.target_critic1, self.critic1, self.tau)
             self._soft_update(self.target_critic2, self.critic2, self.tau)
-            _finite_modules((self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2), "parameters")
+            _finite_modules(modules)
             _finite_tensor(self.log_alpha.detach(), "log_alpha")
             self._finite_optimizer_states()
         except Exception:
-            self._restore_training_state(before_update)
+            self._restore_training_state(before)
             raise
         self.training_step += 1
         return {
@@ -941,12 +913,19 @@ class RecurrentDiscreteSAC:
         }
 
     @staticmethod
-    def _finite_gradients(modules: Iterable[nn.Module] | tuple["RecurrentDiscreteSAC", ...], name: str) -> None:
-        if isinstance(modules, tuple) and modules and isinstance(modules[0], RecurrentDiscreteSAC):
-            tensors = (modules[0].log_alpha,)
+    def _finite_gradients(
+        modules: Iterable[nn.Module] | tuple["RecurrentDiscreteSAC", ...],
+        name: str,
+    ) -> None:
+        if isinstance(modules, tuple) and modules and isinstance(
+            modules[0], RecurrentDiscreteSAC
+        ):
+            parameters = (modules[0].log_alpha,)
         else:
-            tensors = tuple(parameter for module in modules for parameter in module.parameters())
-        for parameter in tensors:
+            parameters = tuple(
+                parameter for module in modules for parameter in module.parameters()
+            )
+        for parameter in parameters:
             if parameter.grad is not None:
                 _finite_tensor(parameter.grad.detach(), name)
 
@@ -966,17 +945,11 @@ class RecurrentDiscreteSAC:
         }
 
     def training_state_dict(self) -> dict[str, object]:
-        """Return a defensive copy of all state required for exact continuation."""
-        _finite_modules(
-            (self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2),
-            "parameters",
-        )
-        _finite_tensor(self.log_alpha.detach(), "log_alpha")
-        self._finite_optimizer_states()
-        return self._snapshot_training_state()
+        state = self._snapshot_training_state()
+        _finite_value_tree(state, "training state")
+        return state
 
-    def load_training_state_dict(self, state: dict[str, object]) -> None:
-        """Restore a complete training state without leaving partial mutations."""
+    def load_training_state_dict(self, state: Mapping[str, object]) -> None:
         required = {
             "actor",
             "critic1",
@@ -990,25 +963,21 @@ class RecurrentDiscreteSAC:
             "log_alpha",
             "training_step",
         }
-        if not isinstance(state, dict) or set(state) != required:
+        if not isinstance(state, Mapping) or set(state) != required:
             raise ValueError("training state is incomplete")
-        if type(state["training_step"]) is not int or state["training_step"] < 0:
-            raise ValueError("training state step is invalid")
+        step = state.get("training_step")
+        if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+            raise ValueError("training step is invalid")
         _finite_value_tree(state, "training state")
-        before_load = self._snapshot_training_state()
+        before = self._snapshot_training_state()
         try:
-            self._restore_training_state(deepcopy(state))
-            _finite_modules(
-                (self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2),
-                "parameters",
-            )
-            _finite_tensor(self.log_alpha.detach(), "log_alpha")
+            self._restore_training_state(deepcopy(dict(state)))
             self._finite_optimizer_states()
         except Exception:
-            self._restore_training_state(before_load)
+            self._restore_training_state(before)
             raise
 
-    def _restore_training_state(self, state: dict[str, object]) -> None:
+    def _restore_training_state(self, state: Mapping[str, object]) -> None:
         self.actor.load_state_dict(state["actor"])
         self.critic1.load_state_dict(state["critic1"])
         self.critic2.load_state_dict(state["critic2"])
@@ -1020,7 +989,7 @@ class RecurrentDiscreteSAC:
         self.alpha_optimizer.load_state_dict(state["alpha_optimizer"])
         with torch.no_grad():
             self.log_alpha.copy_(state["log_alpha"])
-        self.training_step = state["training_step"]
+        self.training_step = int(state["training_step"])
 
     def _finite_optimizer_states(self) -> None:
         for name, optimizer in (
@@ -1032,27 +1001,26 @@ class RecurrentDiscreteSAC:
             _finite_value_tree(optimizer.state_dict(), name)
 
     @staticmethod
-    def _soft_update(target: nn.Module, source: nn.Module, tau: float = 0.005) -> None:
+    def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
         with torch.no_grad():
-            for target_parameter, source_parameter in zip(target.parameters(), source.parameters()):
+            for target_parameter, source_parameter in zip(
+                target.parameters(), source.parameters()
+            ):
                 target_parameter.mul_(1.0 - tau).add_(tau * source_parameter)
 
     def save_checkpoint(self, path: str | Path) -> Path:
         target = Path(path)
         if target.exists():
             raise FileExistsError(f"refusing to overwrite checkpoint: {target}")
-        _finite_modules((self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2), "parameters")
-        _finite_tensor(self.log_alpha.detach(), "log_alpha")
-        self._finite_optimizer_states()
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "format": CHECKPOINT_FORMAT,
             "observation_schema": self.observation_schema,
             "action_schema": self.action_schema,
-            "observation_dim": self.observation_dim,
-            "action_dim": self.action_dim,
+            "observation_dim": OBSERVATION_DIM,
+            "action_dim": ACTION_COUNT,
             "hidden_dim": self.hidden_dim,
-            **self.training_state_dict(),
+            "training_state": self.training_state_dict(),
         }
         with target.open("xb") as handle:
             torch.save(payload, handle)
@@ -1066,51 +1034,40 @@ class RecurrentDiscreteSAC:
             payload = torch.load(source, map_location="cpu", weights_only=True)
         except Exception as exc:
             raise ValueError("checkpoint cannot be safely loaded") from exc
-        if not isinstance(payload, dict) or payload.get("format") != CHECKPOINT_FORMAT:
-            raise ValueError("checkpoint format is incompatible")
-        if payload.get("observation_schema") != self.observation_schema or payload.get("action_schema") != self.action_schema:
+        required = {
+            "format",
+            "observation_schema",
+            "action_schema",
+            "observation_dim",
+            "action_dim",
+            "hidden_dim",
+            "training_state",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != required:
             raise ValueError("checkpoint schema is incompatible")
-        if payload.get("observation_dim") != self.observation_dim or payload.get("action_dim") != self.action_dim or payload.get("hidden_dim") != self.hidden_dim:
-            raise ValueError("checkpoint dimensions are incompatible")
-        for name in ("actor", "critic1", "critic2", "target_critic1", "target_critic2"):
-            state = payload.get(name)
-            if not isinstance(state, dict):
-                raise ValueError(f"checkpoint {name} is missing")
-            for value in state.values():
-                if isinstance(value, Tensor):
-                    _finite_tensor(value, f"checkpoint {name}")
-        log_alpha = payload.get("log_alpha")
-        if not isinstance(log_alpha, Tensor):
-            raise ValueError("checkpoint temperature is missing")
-        _finite_tensor(log_alpha, "checkpoint log_alpha")
-        before_load = self._snapshot_training_state()
-        try:
-            self.actor.load_state_dict(payload["actor"])
-            self.critic1.load_state_dict(payload["critic1"])
-            self.critic2.load_state_dict(payload["critic2"])
-            self.target_critic1.load_state_dict(payload["target_critic1"])
-            self.target_critic2.load_state_dict(payload["target_critic2"])
-            self.actor_optimizer.load_state_dict(payload["actor_optimizer"])
-            self.critic1_optimizer.load_state_dict(payload["critic1_optimizer"])
-            self.critic2_optimizer.load_state_dict(payload["critic2_optimizer"])
-            self.alpha_optimizer.load_state_dict(payload["alpha_optimizer"])
-            with torch.no_grad():
-                self.log_alpha.copy_(log_alpha)
-            self.training_step = int(payload.get("training_step", 0))
-            _finite_modules((self.actor, self.critic1, self.critic2, self.target_critic1, self.target_critic2), "parameters")
-            _finite_tensor(self.log_alpha.detach(), "log_alpha")
-            self._finite_optimizer_states()
-        except Exception:
-            self._restore_training_state(before_load)
-            raise
+        expected = {
+            "format": CHECKPOINT_FORMAT,
+            "observation_schema": self.observation_schema,
+            "action_schema": self.action_schema,
+            "observation_dim": OBSERVATION_DIM,
+            "action_dim": ACTION_COUNT,
+            "hidden_dim": self.hidden_dim,
+        }
+        if any(payload.get(key) != value for key, value in expected.items()):
+            raise ValueError("checkpoint schema is incompatible")
+        self.load_training_state_dict(payload["training_state"])
         return source
 
 
 __all__ = [
-    "LocalObservationV2",
+    "ACTION_SCHEMA",
+    "CHECKPOINT_FORMAT",
+    "LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3",
+    "LocalWaypointObservationV3",
     "PolicyProposal",
-    "RecurrentHiddenState",
+    "REPLAY_SCHEMA_V3",
     "RecurrentDiscreteSAC",
+    "RecurrentHiddenState",
     "ReplaySequenceBatch",
     "SequenceReplay",
     "SequenceTransition",

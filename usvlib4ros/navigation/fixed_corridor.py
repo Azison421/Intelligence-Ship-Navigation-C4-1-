@@ -209,18 +209,40 @@ class FrozenRouteCorridor:
         self,
         state: VesselState,
         previous_progress: float,
+        mission_index: int,
     ) -> CorridorProjection:
         if not state.is_finite():
             raise ValueError("corridor projection requires a finite state")
         if not math.isfinite(previous_progress) or not 0.0 <= previous_progress <= 1.0:
             raise ValueError("previous corridor progress must be in [0, 1]")
+        if (
+            isinstance(mission_index, bool)
+            or not isinstance(mission_index, int)
+            or not 0 <= mission_index < 13
+        ):
+            raise ValueError("corridor projection mission index is invalid")
         total = self.total_length_m
         if total <= 0.0:
             raise ValueError("corridor must have positive length")
 
+        last_polyline_index = self.anchor_polyline_indices[mission_index]
+        maximum_distance = sum(
+            math.dist(start, end)
+            for start, end in zip(
+                self.polyline[:last_polyline_index],
+                self.polyline[1 : last_polyline_index + 1],
+            )
+        )
+        maximum_progress = maximum_distance / total
+        if previous_progress > maximum_progress + 1e-12:
+            raise ValueError("corridor progress is beyond the current mission leg")
+
         best = None
         traversed = 0.0
-        for start, end in zip(self.polyline, self.polyline[1:]):
+        for start, end in zip(
+            self.polyline[:last_polyline_index],
+            self.polyline[1 : last_polyline_index + 1],
+        ):
             dx = end[0] - start[0]
             dy = end[1] - start[1]
             length = math.hypot(dx, dy)
@@ -267,7 +289,10 @@ class FrozenRouteCorridor:
                 dx * (state.y - projected[1])
                 - dy * (state.x - projected[0])
             ) / length
-        lookahead_progress = min(1.0, progress + 1.0 / total)
+        lookahead_progress = min(
+            maximum_progress,
+            progress + 1.0 / total,
+        )
         lookahead, _, _ = self._point_at_progress(lookahead_progress)
         return CorridorProjection(
             cross_track_error_m=cross_track,
