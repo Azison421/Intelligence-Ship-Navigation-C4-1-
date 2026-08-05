@@ -16,7 +16,6 @@ from usvlib4ros.navigation.waypoint_control import (
     CHECKPOINT_SCHEMA_V6,
     OBSERVATION_SCHEMA_V3,
     ActuatorTransitionGuard,
-    CalibratedActionSet,
     NoSafeActionWindow,
 )
 from usvlib4ros.planning.fixed_route import (
@@ -32,14 +31,14 @@ from usvlib4ros.policy.recurrent_sac import LocalWaypointObservationV3
 def _calibrated_profile() -> ForwardControlProfile:
     return ForwardControlProfile(
         calibration_hash="1" * 64,
-        minimum_steerage_throttle=0.3,
+        minimum_steerage_throttle=0.1,
         cruise_throttle=0.4,
         action_controls=(
-            Control(0.3, -0.5),
-            Control(0.4, -0.2),
+            Control(0.1, -0.1),
+            Control(0.1, -0.05),
             Control(0.4, 0.0),
-            Control(0.4, 0.2),
-            Control(0.3, 0.5),
+            Control(0.1, 0.05),
+            Control(0.1, 0.1),
         ),
         positive_rudder_yaw_rate_gain=0.8,
         negative_rudder_yaw_rate_gain=0.9,
@@ -91,32 +90,37 @@ def test_local_waypoint_observation_v3_has_fixed_166_value_contract():
 
 
 def test_five_calibrated_controls_are_percent_unique_and_two_sided():
-    actions = CalibratedActionSet.from_profile(_calibrated_profile())
+    profile = _calibrated_profile()
+    commands = tuple(
+        (
+            int(round(control.throttle * 100.0)),
+            int(round(control.rudder * 100.0)),
+        )
+        for control in profile.action_controls
+    )
 
-    assert actions.schema_version == ACTION_SCHEMA_V3
-    assert len(set(actions.percent_commands)) == 5
-    assert actions.percent_commands[0][1] < actions.percent_commands[1][1] < 0
-    assert actions.percent_commands[2][1] == 0
-    assert 0 < actions.percent_commands[3][1] < actions.percent_commands[4][1]
+    assert profile.action_schema == ACTION_SCHEMA_V3
+    assert len(set(commands)) == 5
+    assert commands[0][1] < commands[1][1] < 0
+    assert commands[2][1] == 0
+    assert 0 < commands[3][1] < commands[4][1]
     assert CHECKPOINT_SCHEMA_V6 == "national-test-sac-checkpoint-v6"
 
 
 def test_percent_duplicate_controls_are_rejected_even_when_floats_differ():
     profile = _calibrated_profile()
-    duplicate = ForwardControlProfile(
-        calibration_hash=profile.calibration_hash,
-        minimum_steerage_throttle=profile.minimum_steerage_throttle,
-        cruise_throttle=profile.cruise_throttle,
-        action_controls=(
-            Control(0.301, -0.501),
-            Control(0.304, -0.504),
-            *profile.action_controls[2:],
-        ),
-        action_schema=ACTION_SCHEMA_V3,
-    )
-
-    with pytest.raises(ValueError, match="unique.*percent"):
-        CalibratedActionSet.from_profile(duplicate)
+    with pytest.raises(ValueError, match="unique after percent"):
+        ForwardControlProfile(
+            calibration_hash=profile.calibration_hash,
+            minimum_steerage_throttle=profile.minimum_steerage_throttle,
+            cruise_throttle=profile.cruise_throttle,
+            action_controls=(
+                Control(0.101, -0.101),
+                Control(0.104, -0.104),
+                *profile.action_controls[2:],
+            ),
+            action_schema=ACTION_SCHEMA_V3,
+        )
 
 
 def test_extreme_rudder_reversal_requires_executed_straight_transition():

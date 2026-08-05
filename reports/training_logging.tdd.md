@@ -1,62 +1,41 @@
-# Train 按钮 CSV/SVG 日志 TDD 证据
+# National_Test V6 遥测契约
 
-> 历史说明：本文冻结最初“Train 仅运行闭环 episode”的旧日志接入证据。无参数
-> 入口现已接入实际 SAC 混合自训练，并在不改变本文 3 份 CSV／3 张 SVG 的基础上
-> 新增自训练 CSV／SVG；当前契约见 [`self_training.tdd.md`](./self_training.tdd.md)。
+日期：2026-08-05
 
-日期：2026-08-04  
-来源：根据本轮用户需求直接形成，没有外部计划文件。
+## 离线训练进度
 
-## 用户路径
+`tools/train_fixed_map_sac.py` 每个完整回合更新
+`artifacts/logs/national_test_training_progress.json`。字段包括阶段、代次、训练回合、
+块内进度、评估次数/通过数、步数、完成航点、碰撞/超时、安全干预、净空、停止原因
+和 reward。同一内容逐局追加到 `national-test-offline-training-*.jsonl`，进度 JSON
+只保留最新一局；
+恢复训练只读取严格的 `national-test-self-training-state-v2` 状态。
 
-1. 用户点击 Unity“开始训练”后，每次点击获得独立 `run_id`。
-2. 每个 episode 结束时，用户可以从 CSV 读取总步长、到终点总步长，以及到达
-   13 个目标点时的累计／分段步长。
-3. 用户多次点击训练后，历史记录继续追加，SVG 使用全部历史 episode 自动重绘。
-4. 未到达的目标点显示为空值和曲线断点，不得伪造为 0 步。
+`full_route` 区分完整路线与走廊分段扰动出生；只有 `gate_eligible=true` 的确定性
+`OFFLINE_EVAL` 局可以计入 20/20。训练局从后段出生后偶然完成 13 点不算晋级。
 
-## RED
+运行 `python tools\export_training_reports.py` 可把最新离线 JSONL 导出为 V6 episode
+CSV，以及 reward、steps、完成航点 SVG。传入 `--runtime-log` 后还会把 Unity 控制周期
+导出为扁平 CSV 和 cycle time／mission index SVG。导出是只读投影，不参与模型门控。
 
-命令：
+## Unity 运行遥测
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests/test_training_reports.py
-```
+`FixedMapNavigationService` 为每次进程创建一个
+`national-test-runtime-YYYYMMDD-HHMMSS.jsonl`。每个控制周期记录：
 
-结果：测试收集失败，错误为
-`ModuleNotFoundError: No module named 'usvlib4ros.navigation.training_reports'`。
-失败原因正是报告模块尚未实现，而不是测试语法或环境错误。
+- `policy_action`：SAC 提议；
+- `reachability_mask`：舵角换向约束；
+- `safe_action_mask`：预测安全结果；
+- `executed_action` 和最终 `NavigationStatus` 油门/舵角百分比；
+- `device_feedback`：只读 `DeviceStatus` 回读；
+- 航点索引、目标距离、安全干预、停止原因和周期耗时。
 
-## GREEN 与覆盖率
-
-| 保证 | 用例／命令 | 类型 | 结果 |
-|---|---|---|---|
-| 两次训练点击跨进程格式累计为连续 global episode | `test_report_logger_appends_runs_and_renders_step_curves` | 单元 | PASS |
-| 3 份 CSV 与 3 张灰度 SVG 均生成 | 同上 | 单元 | PASS |
-| 目标累计步长严格递增，错误数据被拒绝 | `test_report_logger_rejects_non_monotonic_waypoint_steps` | 单元 | PASS |
-| Train UI 服务链在 episode 后写报告 | `test_train_button_episode_is_written_to_reports` | 集成 | PASS |
-| 既有样例入口与生命周期保持兼容 | `tests/test_sample_entry_compatibility.py` | 集成 | 13 PASS |
-
-最终点名验证：
-
-```text
-tests/test_training_reports.py + tests/test_sample_entry_compatibility.py
-16 passed in 2.17s
-```
-
-环境没有安装 `coverage.py`，因此使用 Python 标准库 `trace` 对新模块执行相同的
-3 个用例；结果为 410 个可执行行中覆盖 383 行，行覆盖率 **93.41%**。
-
-测试生成的 `waypoint_cumulative_steps.svg` 又经本机无界面浏览器渲染为 PNG 做
-视觉检查：坐标、图例、灰黑线型、单点和缺失值断点均正常。预览使用合成数据，未
-写入正式 `reports` CSV/SVG。
+控制异常、操作员中止和 episode 结束均单独记录。日志不包含 ROS 主机、设备标识或
+其他连接凭据。
 
 ## 边界
 
-- 严格没有运行全量 pytest。
-- 没有启动 Unity、ROS 或 MATLAB；UI 接入由隔离服务测试验证，真实点击结果仍需
-  用户下一次 Unity 运行产生。
-- 本文测试时 UI“训练”尚未在线更新 SAC；该陈述仅为历史状态。当前无参数入口会
-  更新 SAC，显式 checkpoint、显式模式和 `--validate-only` 才保持确定性无梯度。
-- 工作树在本轮开始前已有其他未提交修改，因此没有创建 TDD checkpoint commit；
-  RED/GREEN 证据保存在本文件中。
+- 单周期预算 100 ms；超限立即归零且本局不计训练门成绩。
+- 单局墙钟上限 600 s。
+- 操作员中止和输入陈旧保存安全前缀，但不施加终止惩罚，也不计晋级成绩。
+- 只有真实 Unity 5/5 验收可以产生比赛默认 checkpoint。

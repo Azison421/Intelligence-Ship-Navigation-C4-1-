@@ -494,6 +494,7 @@ class SequenceReplay:
 class _RecurrentHead(nn.Module):
     def __init__(self, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
+        self.input_norm = nn.LayerNorm(OBSERVATION_DIM)
         self.gru = nn.GRU(OBSERVATION_DIM, hidden_dim, batch_first=True)
         self.head = nn.Linear(hidden_dim, output_dim)
 
@@ -516,8 +517,9 @@ class _RecurrentHead(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if observations.ndim != 3 or observations.shape[-1] != OBSERVATION_DIM:
             raise ValueError("observations must have shape [batch, time, 166]")
+        normalized = self.input_norm(observations)
         if reset_mask is None:
-            encoded, output_hidden = self.gru(observations, hidden)
+            encoded, output_hidden = self.gru(normalized, hidden)
             return self.head(encoded), output_hidden
         if reset_mask.shape != observations.shape[:2]:
             raise ValueError("reset_mask must match batch and time")
@@ -527,10 +529,10 @@ class _RecurrentHead(nn.Module):
             current_hidden = self._reset_hidden(
                 current_hidden,
                 reset_mask[:, index],
-                observations.dtype,
+                normalized.dtype,
             )
             encoded, current_hidden = self.gru(
-                observations[:, index : index + 1], current_hidden
+                normalized[:, index : index + 1], current_hidden
             )
             outputs.append(self.head(encoded))
         if not outputs:
@@ -544,12 +546,13 @@ class _RecurrentHead(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if observations.ndim != 3 or reset_mask.shape != observations.shape[:2]:
             raise ValueError("sequence shapes are incompatible")
+        normalized = self.input_norm(observations)
         outputs: list[Tensor] = []
         history: list[Tensor] = []
         hidden: Optional[Tensor] = None
         for index in range(observations.shape[1]):
-            hidden = self._reset_hidden(hidden, reset_mask[:, index], observations.dtype)
-            encoded, hidden = self.gru(observations[:, index : index + 1], hidden)
+            hidden = self._reset_hidden(hidden, reset_mask[:, index], normalized.dtype)
+            encoded, hidden = self.gru(normalized[:, index : index + 1], hidden)
             outputs.append(self.head(encoded))
             history.append(hidden[0].unsqueeze(1))
         if not outputs:
@@ -569,11 +572,12 @@ class _RecurrentHead(nn.Module):
             or reset_mask.shape != observations.shape[:2]
         ):
             raise ValueError("next-observation history shapes are incompatible")
+        normalized = self.input_norm(observations)
         outputs: list[Tensor] = []
         for index in range(observations.shape[1]):
             hidden = history[:, index : index + 1].transpose(0, 1)
-            hidden = self._reset_hidden(hidden, reset_mask[:, index], observations.dtype)
-            encoded, _ = self.gru(observations[:, index : index + 1], hidden)
+            hidden = self._reset_hidden(hidden, reset_mask[:, index], normalized.dtype)
+            encoded, _ = self.gru(normalized[:, index : index + 1], hidden)
             outputs.append(self.head(encoded))
         if not outputs:
             raise ValueError("observations must contain a time step")
@@ -868,7 +872,7 @@ class RecurrentDiscreteSAC:
         entropy = -(current_prob * current_log_prob).sum(dim=-1)[actor_mask].mean()
         safe_count = batch.safe_action_mask.to(torch.float32).sum(dim=-1).clamp_min(1.0)
         desired_entropy = (0.5 * torch.log(safe_count))[actor_mask].mean().detach()
-        alpha_loss = -(self.log_alpha * (entropy.detach() - desired_entropy))
+        alpha_loss = self.log_alpha * (entropy.detach() - desired_entropy)
         for loss, name in (
             (critic_loss, "critic_loss"),
             (actor_loss, "actor_loss"),

@@ -6,18 +6,13 @@ import inspect
 import math
 from types import SimpleNamespace
 
-from usvlib4ros.mapping import GpsProjector
 from usvlib4ros.navigation.fixed_map_runtime import (
     FixedMapControllerCore,
     RuntimeInput,
-    build_live_route_context,
+    build_fixed_route_context,
 )
 from usvlib4ros.navigation.waypoint_control import ACTION_SCHEMA_V3
 from usvlib4ros.planning import Control, VesselState
-from usvlib4ros.planning.fixed_route import (
-    compile_offline_national_map,
-    fixed_route_goal_xy,
-)
 from usvlib4ros.planning.forward_control_profile import (
     ForwardControlProfile,
     reduced_dynamics_from_profile,
@@ -26,20 +21,19 @@ from usvlib4ros.policy.recurrent_sac import LocalWaypointObservationV3
 
 
 class _RecordingPolicy:
-    full_safe_action_authority = True
     action_schema = ACTION_SCHEMA_V3
 
     def __init__(self) -> None:
         self.forward_control_profile = ForwardControlProfile(
             calibration_hash="2" * 64,
-            minimum_steerage_throttle=0.3,
+            minimum_steerage_throttle=0.1,
             cruise_throttle=0.4,
             action_controls=(
-                Control(0.3, -0.5),
-                Control(0.4, -0.2),
+                Control(0.1, -0.1),
+                Control(0.1, -0.05),
                 Control(0.4, 0.0),
-                Control(0.4, 0.2),
-                Control(0.3, 0.5),
+                Control(0.1, 0.05),
+                Control(0.1, 0.1),
             ),
             action_schema=ACTION_SCHEMA_V3,
         )
@@ -87,36 +81,7 @@ class _NoSafeSupervisor(_PermissiveSupervisor):
 
 
 def _context():
-    compiled = compile_offline_national_map(
-        session_id="direct-runtime-fixture",
-        required_clearance_m=0.2,
-    )
-    manifest = compiled.manifest
-    projector = GpsProjector(*manifest.gps_origin)
-    points = tuple(
-        SimpleNamespace(lat=lat, lng=lng)
-        for lat, lng in (
-            projector.enu_to_gps(x, y)
-            for x, y in manifest.route_points_enu
-        )
-    )
-    route = SimpleNamespace(
-        id=manifest.route_id,
-        name=manifest.route_name,
-        version=1785568402934,
-        start_index=0,
-        points=points,
-    )
-    pose = SimpleNamespace(
-        lat=points[0].lat,
-        lng=points[0].lng,
-        yaw=0.0,
-        speed=0.0,
-        rotate_speed=0.0,
-    )
-    return build_live_route_context(
-        route,
-        pose,
+    return build_fixed_route_context(
         session_id="direct-runtime-fixture",
     )
 
@@ -197,7 +162,14 @@ def test_runtime_uses_exact_calibrated_candidates_without_point_clipping():
     assert tuple(candidate.control for candidate in core.candidates) == (
         policy.forward_control_profile.action_controls
     )
-    assert len(set(core.action_set.percent_commands)) == 5
+    percent_commands = {
+        (
+            int(round(candidate.control.throttle * 100.0)),
+            int(round(candidate.control.rudder * 100.0)),
+        )
+        for candidate in core.candidates
+    }
+    assert len(percent_commands) == 5
     assert decision.control == policy.forward_control_profile.action_controls[2]
     assert decision.policy_action == 2
     assert decision.action == 2

@@ -7,11 +7,13 @@ from enum import Enum
 from hashlib import sha256
 import json
 from pathlib import Path
+import time
 from typing import Callable, Mapping, Optional
 
 import torch
 
 from usvlib4ros.navigation.fixed_map_runtime import (
+    DEFAULT_CHECKPOINT,
     LASER_EMERGENCY_DISTANCE_M,
     REQUIRED_MAP_CLEARANCE_M,
     RuntimeDecision,
@@ -23,6 +25,7 @@ from usvlib4ros.planning.forward_control_profile import (
     ForwardControlProfile,
     action_protocol_hash,
     forward_control_profile_from_dict,
+    forward_control_profile_to_dict,
 )
 
 from .fixed_map_trainer import (
@@ -146,7 +149,7 @@ class TrainingSnapshot:
     cursor: TrainingCursor
     profile: ForwardControlProfile
     training_state: dict[str, object]
-    replay_state: dict[str, object]
+    replay: SequenceReplay
 
 
 class TrainingStateStore:
@@ -163,14 +166,23 @@ class TrainingStateStore:
         payload = {
             "schema_version": STATE_SCHEMA,
             "cursor": cursor.to_payload(),
-            "profile": asdict(trainer.forward_profile),
+            "profile": forward_control_profile_to_dict(
+                trainer.forward_profile
+            ),
             "training_state": trainer.sac.training_state_dict(),
             "replay_state": trainer.replay.state_dict(),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         torch.save(payload, temporary)
-        temporary.replace(self.path)
+        for attempt in range(20):
+            try:
+                temporary.replace(self.path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
         return self.path
 
     def load(self) -> TrainingSnapshot:
@@ -197,8 +209,21 @@ class TrainingStateStore:
             cursor=TrainingCursor.from_payload(payload["cursor"]),
             profile=profile,
             training_state=dict(payload["training_state"]),
-            replay_state=replay.state_dict(),
+            replay=replay,
         )
+
+    def restore_trainer(self) -> tuple[TrainingCursor, FixedMapSACTrainer]:
+        snapshot = self.load()
+        trainer = FixedMapSACTrainer(
+            snapshot.profile,
+            seed=snapshot.cursor.seed,
+        )
+        trainer.sac.load_training_state_dict(snapshot.training_state)
+        trainer.replay = snapshot.replay
+        trainer.completed_training_episodes = (
+            snapshot.cursor.completed_training_episodes
+        )
+        return snapshot.cursor, trainer
 
 
 class ActiveCheckpointRegistry:
@@ -302,7 +327,7 @@ def _manifest(
             "calibration_hash": profile.calibration_hash,
             "action_protocol_hash": action_protocol_hash(profile),
         },
-        "forward_control_profile": asdict(profile),
+        "forward_control_profile": forward_control_profile_to_dict(profile),
         "stage": cursor.stage.value,
         "gate_evidence": {
             "completed_training_episodes": cursor.completed_training_episodes,
@@ -322,10 +347,15 @@ def save_stage_checkpoint(
 ) -> tuple[Path, TrainingCursor]:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    name = (
-        f"national_test_sac_v6_seed{cursor.seed}_"
-        f"g{cursor.generation}_{cursor.stage.value.lower()}.pt"
-    )
+    if cursor.stage is SelfTrainingStage.PROMOTED:
+        name = DEFAULT_CHECKPOINT.name
+    else:
+        name = (
+            f"national_test_sac_v6_seed{cursor.seed}_"
+            f"g{cursor.generation}_{cursor.stage.value.lower()}_"
+            f"a{cursor.unity_adapt_episodes}_"
+            f"v{cursor.unity_validation_episodes}.pt"
+        )
     checkpoint = directory / name
     trainer.sac.save_checkpoint(checkpoint)
     manifest_path = checkpoint.with_suffix(checkpoint.suffix + ".json")
@@ -393,18 +423,12 @@ class OfflineTrainingGate:
                 self.profile,
                 seed=self.seed,
             )
-        snapshot = self.state_store.load()
-        if snapshot.cursor.seed != self.seed:
+        cursor, trainer = self.state_store.restore_trainer()
+        if cursor.seed != self.seed:
             raise ValueError("training state seed differs from requested seed")
-        if snapshot.profile.calibration_hash != self.profile.calibration_hash:
+        if trainer.forward_profile.calibration_hash != self.profile.calibration_hash:
             raise ValueError("training state calibration differs from requested profile")
-        trainer = FixedMapSACTrainer(snapshot.profile, seed=self.seed)
-        trainer.sac.load_training_state_dict(snapshot.training_state)
-        trainer.replay = SequenceReplay.from_state_dict(snapshot.replay_state)
-        trainer.completed_training_episodes = (
-            snapshot.cursor.completed_training_episodes
-        )
-        return snapshot.cursor, trainer
+        return cursor, trainer
 
     def _save(
         self,
@@ -585,11 +609,17 @@ class UnityTransitionRecorder:
         if not terminal and decision.training_trace is not None:
             self._pending = decision.training_trace
 
-    def operator_stop(self, mission_index: int) -> None:
+    def truncate(
+        self,
+        mission_index: int,
+        *,
+        reason: str,
+        operator_truncated: bool = False,
+    ) -> None:
         if self._pending is None:
             return
         decision = RuntimeDecision(
-            reason="OPERATOR_TRUNCATED",
+            reason=reason,
             control=None,
             action=None,
             policy_action=None,
@@ -607,6 +637,13 @@ class UnityTransitionRecorder:
             decision,
             terminated=False,
             truncated=True,
+            reason=reason,
+            operator_truncated=operator_truncated,
+        )
+
+    def operator_stop(self, mission_index: int) -> None:
+        self.truncate(
+            mission_index,
             reason="OPERATOR_TRUNCATED",
             operator_truncated=True,
         )
@@ -625,6 +662,135 @@ def train_from_unity_episode(
         trainer.sac.update(batch)
 
 
+class UnityTrainingGate:
+    """Advance exactly five adaptation and five frozen validation episodes."""
+
+    def __init__(
+        self,
+        *,
+        state_store: TrainingStateStore,
+        checkpoint_dir: Path,
+    ) -> None:
+        self.state_store = state_store
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.registry = ActiveCheckpointRegistry(
+            self.checkpoint_dir / "national_test_sac_active.json"
+        )
+        self.cursor, self.trainer = state_store.restore_trainer()
+        if self.cursor.stage not in {
+            SelfTrainingStage.UNITY_ADAPT,
+            SelfTrainingStage.UNITY_VALIDATION,
+        }:
+            raise ValueError(
+                f"Unity gate is unavailable during {self.cursor.stage.value}"
+            )
+        active = self.registry.resolve(DEFAULT_CHECKPOINT)
+        if self.cursor.active_checkpoint != active.name:
+            raise ValueError("training state and active checkpoint differ")
+
+    @property
+    def deterministic(self) -> bool:
+        return self.cursor.stage is SelfTrainingStage.UNITY_VALIDATION
+
+    def _save_new_active(self) -> None:
+        checkpoint, self.cursor = save_stage_checkpoint(
+            self.checkpoint_dir,
+            self.trainer,
+            self.cursor,
+        )
+        self.registry.write(checkpoint, self.cursor.stage)
+        self.state_store.save(self.cursor, self.trainer)
+
+    def finish_episode(
+        self,
+        transitions: tuple[SequenceTransition, ...],
+        *,
+        counted: bool,
+        passed: bool,
+        operator_truncated: bool,
+    ) -> TrainingCursor:
+        if type(counted) is not bool or type(passed) is not bool:
+            raise ValueError("Unity gate flags must be boolean")
+        if type(operator_truncated) is not bool:
+            raise ValueError("operator_truncated must be boolean")
+        if not counted:
+            if transitions:
+                self.trainer.replay.add_episode(transitions)
+            self.cursor = replace(
+                self.cursor,
+                operator_truncated_episodes=(
+                    self.cursor.operator_truncated_episodes
+                    + int(operator_truncated)
+                ),
+            )
+            self.state_store.save(self.cursor, self.trainer)
+            return self.cursor
+
+        if self.cursor.stage is SelfTrainingStage.UNITY_ADAPT:
+            train_from_unity_episode(self.trainer, transitions)
+            adapt_episodes = self.cursor.unity_adapt_episodes + 1
+            self.cursor = replace(
+                self.cursor,
+                unity_adapt_episodes=adapt_episodes,
+                stage=(
+                    SelfTrainingStage.UNITY_VALIDATION
+                    if adapt_episodes == UNITY_ADAPT_EPISODES
+                    else SelfTrainingStage.UNITY_ADAPT
+                ),
+            )
+            self._save_new_active()
+            return self.cursor
+
+        if not passed and transitions:
+            self.trainer.replay.add_episode(transitions)
+        validation_episodes = self.cursor.unity_validation_episodes + 1
+        validation_passes = self.cursor.unity_validation_passes + int(passed)
+        self.cursor = replace(
+            self.cursor,
+            unity_validation_episodes=validation_episodes,
+            unity_validation_passes=validation_passes,
+        )
+        if validation_episodes < UNITY_VALIDATION_EPISODES:
+            checkpoint = self.checkpoint_dir / str(
+                self.cursor.active_checkpoint
+            )
+            update_checkpoint_stage(checkpoint, self.cursor)
+            self.registry.write(checkpoint, self.cursor.stage)
+            self.state_store.save(self.cursor, self.trainer)
+            return self.cursor
+
+        if validation_passes == UNITY_VALIDATION_EPISODES:
+            self.cursor = replace(
+                self.cursor,
+                stage=SelfTrainingStage.PROMOTED,
+            )
+            self._save_new_active()
+            return self.cursor
+
+        failed_checkpoint = self.checkpoint_dir / str(
+            self.cursor.active_checkpoint
+        )
+        failed_cursor = replace(
+            self.cursor,
+            stage=SelfTrainingStage.OFFLINE_TRAIN,
+        )
+        update_checkpoint_stage(failed_checkpoint, failed_cursor)
+        self.registry.write(failed_checkpoint, failed_cursor.stage)
+        self.cursor = replace(
+            failed_cursor,
+            generation=failed_cursor.generation + 1,
+            offline_block_progress=0,
+            offline_evaluations=0,
+            offline_evaluation_passes=0,
+            unity_adapt_episodes=0,
+            unity_validation_episodes=0,
+            unity_validation_passes=0,
+            active_checkpoint=None,
+        )
+        self.state_store.save(self.cursor, self.trainer)
+        return self.cursor
+
+
 __all__ = [
     "ACTIVE_SCHEMA",
     "ActiveCheckpointRegistry",
@@ -640,6 +806,7 @@ __all__ = [
     "UNITY_ADAPT_EPISODES",
     "UNITY_VALIDATION_EPISODES",
     "UnityTransitionRecorder",
+    "UnityTrainingGate",
     "load_calibration",
     "save_stage_checkpoint",
     "train_from_unity_episode",

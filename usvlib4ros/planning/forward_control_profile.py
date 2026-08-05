@@ -380,7 +380,7 @@ def forward_control_profile_from_dict(
     if payload.get("action_schema") != ACTION_SCHEMA:
         raise ValueError("forward-control action schema is incompatible")
     raw_controls = payload.get("action_controls")
-    if not isinstance(raw_controls, list) or len(raw_controls) != 5:
+    if not isinstance(raw_controls, (list, tuple)) or len(raw_controls) != 5:
         raise ValueError("forward-control action table is invalid")
     controls = []
     for item in raw_controls:
@@ -409,6 +409,36 @@ def forward_control_profile_from_dict(
         speed_response=float(payload.get("speed_response", 0.8)),
         yaw_response=float(payload.get("yaw_response", 4.0)),
     )
+
+
+def forward_control_profile_to_dict(
+    profile: ForwardControlProfile,
+) -> dict[str, object]:
+    if not isinstance(profile, ForwardControlProfile):
+        raise ValueError("forward-control profile is invalid")
+    return {
+        "calibration_hash": profile.calibration_hash,
+        "minimum_steerage_throttle": profile.minimum_steerage_throttle,
+        "cruise_throttle": profile.cruise_throttle,
+        "action_controls": [
+            {
+                "throttle": control.throttle,
+                "rudder": control.rudder,
+            }
+            for control in profile.action_controls
+        ],
+        "throttle_speed_gain": profile.throttle_speed_gain,
+        "positive_rudder_yaw_rate_gain": (
+            profile.positive_rudder_yaw_rate_gain
+        ),
+        "negative_rudder_yaw_rate_gain": (
+            profile.negative_rudder_yaw_rate_gain
+        ),
+        "speed_response": profile.speed_response,
+        "yaw_response": profile.yaw_response,
+        "action_schema": profile.action_schema,
+        "schema_version": profile.schema_version,
+    }
 
 
 def reduced_dynamics_from_profile(
@@ -467,6 +497,7 @@ __all__ = [
     "action_protocol_hash",
     "forward_probe_abort_reason",
     "forward_control_profile_from_dict",
+    "forward_control_profile_to_dict",
     "initial_turn_probe_controls",
     "reduced_dynamics_from_profile",
     "supplemental_turn_probe_controls",

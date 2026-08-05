@@ -11,14 +11,12 @@ from .recurrent_sac import (
 )
 from .safety_supervisor import (
     CandidateControl,
-    CandidateControlGenerator,
     PredictiveSafetySupervisor,
     SafetyDecision,
 )
 
 __all__ = [
     "CandidateControl",
-    "CandidateControlGenerator",
     "LocalWaypointObservationV3",
     "PolicyProposal",
     "RecurrentHiddenState",

@@ -43,5 +43,8 @@ def test_retired_source_paths_are_absent():
         "usvlib4ros/navigation/route_plan_service.py",
         "usvlib4ros/vehicle",
         "usvlib4ros/usvRosUtil/ros_bag_util.py",
+        "usvlib4ros/usvRosUtil/nmea_util.py",
+        "usvlib4ros/usvRosUtil/usv_util.py",
+        "usvlib4ros/msg/parameter.py",
     )
     assert [path for path in retired if (ROOT / path).exists()] == []

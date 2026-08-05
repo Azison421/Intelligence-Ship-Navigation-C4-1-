@@ -81,7 +81,7 @@ def control_transition_reward(
         reward += 250.0
     elif terminated:
         reward -= 150.0 if reason == "NO_SAFE_ACTION_TRUNCATED" else 250.0
-    elif truncated and reason != "OPERATOR_TRUNCATED":
+    elif truncated and reason not in {"INPUT_STALE", "OPERATOR_TRUNCATED"}:
         reward -= 25.0
     return reward
 
@@ -181,7 +181,7 @@ class FixedMapSACTrainer:
         seed: int,
         hidden_dim: int = 64,
         sac: Optional[RecurrentDiscreteSAC] = None,
-        replay_capacity: int = 1_024,
+        replay_capacity: int = 64,
     ) -> None:
         if not isinstance(forward_profile, ForwardControlProfile):
             raise ValueError("trainer requires a verified forward profile")
@@ -487,7 +487,11 @@ class FixedMapSACTrainer:
                 no_safe = decision.reason == "NO_SAFE_ACTION_TRUNCATED"
                 break
             if decision.control is None:
-                state = replace(state, stamp_sim=state.stamp_sim + CONTROL_PERIOD_S)
+                state = dynamics.propagate(
+                    state,
+                    Control(0.0, 0.0),
+                    CONTROL_PERIOD_S,
+                )[-1]
                 continue
             if decision.training_trace is None:
                 raise RuntimeError("executed control has no training trace")

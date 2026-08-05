@@ -21,12 +21,40 @@ from usvlib4ros.navigation.fixed_map_runtime import (
 )
 from usvlib4ros.planning.fixed_route import LIVE_PROFILE_PATH, SIDECAR_PATH
 from usvlib4ros.policy.checkpoint_promotion import PolicyMode
+from usvlib4ros.policy.self_training import (
+    MAX_TRAINING_EPISODES,
+    SelfTrainingStage,
+    TrainingStateStore,
+    UnityTrainingGate,
+    UnityTransitionRecorder,
+)
 from usvlib4ros.usvRosUtil import LogUtil
 
 
 CONTROL_PERIOD_S = 0.1
-MAX_TRAINING_EPISODES = 1_000
+MAX_EPISODE_SECONDS = 600.0
 TELEMETRY_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "logs"
+TRAINING_STATE_PATH = (
+    DEFAULT_CHECKPOINT.parent / "national_test_self_training_v2.pt"
+)
+ENVIRONMENT_STOP_REASONS = frozenset(
+    {
+        "DEVICE_STALE",
+        "INPUT_INVALID",
+        "NOT_IN_AUTO_MODE",
+        "POSE_STALE",
+        "SCAN_STALE",
+    }
+)
+POLICY_FAILURE_REASONS = frozenset(
+    {
+        "DYNAMICS_INVALID",
+        "LASER_EMERGENCY_STOP",
+        "MAP_INVALID",
+        "NO_SAFE_ACTION_TRUNCATED",
+        "POLICY_NO_ACTION",
+    }
+)
 
 
 def preflight_assets(checkpoint_path: Optional[Path] = None) -> None:
@@ -211,24 +239,52 @@ class FixedMapNavigationService:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
-    def _run_episode(self, episode: int, telemetry: Path) -> str:
+    def _run_episode(
+        self,
+        episode: int,
+        telemetry: Path,
+        *,
+        policy=None,
+        deterministic_policy: Optional[bool] = None,
+    ) -> tuple[str, tuple]:
         if self._wait_for_pose() is None:
-            return "SERVICE_STOPPED"
+            return "SERVICE_STOPPED", ()
         context = build_fixed_route_context(
             session_id=f"national-test-live-{episode}-{time.time_ns()}",
         )
-        policy = load_policy(self.checkpoint_path, context, self.policy_mode)
+        active_policy = policy or load_policy(
+            self.checkpoint_path,
+            context,
+            self.policy_mode,
+        )
+        deterministic = (
+            self.validate_only or not self.self_training
+            if deterministic_policy is None
+            else deterministic_policy
+        )
+        if type(deterministic) is not bool:
+            raise ValueError("deterministic policy flag must be boolean")
         core = FixedMapControllerCore(
             context,
-            policy,
-            deterministic_policy=self.validate_only or not self.self_training,
+            active_policy,
+            deterministic_policy=deterministic,
         )
         adapter = LiveInputAdapter(self.global_data, context)
+        recorder = UnityTransitionRecorder()
+        episode_started = time.monotonic()
         step = 0
         while not self._stop.is_set():
             cycle_started = time.perf_counter()
+            if time.monotonic() - episode_started >= MAX_EPISODE_SECONDS:
+                recorder.truncate(
+                    core.mission_index,
+                    reason="TIME_LIMIT",
+                )
+                self._publish_zero(point_index=core.mission_index)
+                return "TIME_LIMIT", recorder.transitions
             sample = adapter.build()
             if sample.task_status == 0:
+                recorder.operator_stop(core.mission_index)
                 self._publish_zero(
                     point_index=core.mission_index,
                     distance=core._distance(sample.vessel_state),
@@ -240,7 +296,7 @@ class FixedMapNavigationService:
                     step=step,
                     cycle_ms=(time.perf_counter() - cycle_started) * 1000.0,
                 )
-                return "OPERATOR_TRUNCATED"
+                return "OPERATOR_TRUNCATED", recorder.transitions
             try:
                 decision = core.step(sample)
             except Exception as exc:
@@ -253,7 +309,15 @@ class FixedMapNavigationService:
                     cycle_ms=(time.perf_counter() - cycle_started) * 1000.0,
                     detail=f"{type(exc).__name__}:{exc}",
                 )
-                return "CONTROLLER_EXCEPTION"
+                return "CONTROLLER_EXCEPTION", ()
+            recorder.observe(decision)
+            if decision.reason in ENVIRONMENT_STOP_REASONS:
+                recorder.truncate(
+                    core.mission_index,
+                    reason="INPUT_STALE",
+                )
+                self._publish_zero(point_index=core.mission_index)
+                return "INPUT_STALE", recorder.transitions
             command = self._publish_decision(decision)
             elapsed_ms = (time.perf_counter() - cycle_started) * 1000.0
             self._record(
@@ -267,22 +331,47 @@ class FixedMapNavigationService:
             )
             self._algorithm_status(episode=episode, step=step, running=True)
             step += 1
+            if elapsed_ms > CONTROL_PERIOD_S * 1_000.0:
+                self._publish_zero(point_index=core.mission_index)
+                return "CONTROL_DEADLINE_MISSED", ()
             if decision.completed:
                 self._publish_zero(point_index=13)
-                return "MISSION_COMPLETE"
-            if decision.safety_truncated:
+                return "MISSION_COMPLETE", recorder.transitions
+            if decision.reason in POLICY_FAILURE_REASONS:
                 self._publish_zero(point_index=decision.mission_index)
-                return "NO_SAFE_ACTION_TRUNCATED"
+                return decision.reason, recorder.transitions
             remaining = CONTROL_PERIOD_S - (time.perf_counter() - cycle_started)
             if remaining > 0.0:
                 self._stop.wait(remaining)
-        return "SERVICE_STOPPED"
+        recorder.operator_stop(core.mission_index)
+        return "SERVICE_STOPPED", recorder.transitions
 
     def run(self) -> None:
         telemetry = self._open_telemetry()
         episode = 0
+        unity_gate = None
         try:
+            if self.self_training:
+                manifest_path = self.checkpoint_path.with_suffix(
+                    self.checkpoint_path.suffix + ".json"
+                )
+                checkpoint_stage = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                ).get("stage")
+                if checkpoint_stage == SelfTrainingStage.PROMOTED.value:
+                    self.self_training = False
+                    self.validate_only = True
+                else:
+                    unity_gate = UnityTrainingGate(
+                        state_store=TrainingStateStore(TRAINING_STATE_PATH),
+                        checkpoint_dir=DEFAULT_CHECKPOINT.parent,
+                    )
             while not self._stop.is_set():
+                if unity_gate is not None and unity_gate.cursor.stage not in {
+                    SelfTrainingStage.UNITY_ADAPT,
+                    SelfTrainingStage.UNITY_VALIDATION,
+                }:
+                    return
                 self._publish_zero()
                 if int(
                     getattr(self.global_data.device_data, "task_status", 0) or 0
@@ -291,14 +380,70 @@ class FixedMapNavigationService:
                     self._stop.wait(0.05)
                     continue
                 episode += 1
-                outcome = self._run_episode(episode, telemetry)
+                outcome, transitions = self._run_episode(
+                    episode,
+                    telemetry,
+                    policy=(
+                        unity_gate.trainer.sac
+                        if unity_gate is not None
+                        else None
+                    ),
+                    deterministic_policy=(
+                        unity_gate.deterministic
+                        if unity_gate is not None
+                        else None
+                    ),
+                )
+                stage_detail = outcome
+                if unity_gate is not None:
+                    counted = outcome not in {
+                        "CONTROLLER_EXCEPTION",
+                        "CONTROL_DEADLINE_MISSED",
+                        "INPUT_STALE",
+                        "OPERATOR_TRUNCATED",
+                        "SERVICE_STOPPED",
+                    }
+                    cursor = unity_gate.finish_episode(
+                        transitions,
+                        counted=counted,
+                        passed=outcome == "MISSION_COMPLETE",
+                        operator_truncated=(
+                            outcome == "OPERATOR_TRUNCATED"
+                        ),
+                    )
+                    if cursor.active_checkpoint is not None:
+                        self.checkpoint_path = (
+                            DEFAULT_CHECKPOINT.parent
+                            / cursor.active_checkpoint
+                        )
+                    stage_detail = f"{outcome}:{cursor.stage.value}"
+                    print(
+                        json.dumps(
+                            {
+                                "outcome": outcome,
+                                "stage": cursor.stage.value,
+                                "unity_adapt_episodes": (
+                                    cursor.unity_adapt_episodes
+                                ),
+                                "unity_validation_episodes": (
+                                    cursor.unity_validation_episodes
+                                ),
+                                "unity_validation_passes": (
+                                    cursor.unity_validation_passes
+                                ),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
                 self._record(
                     telemetry,
                     event="episode_end",
                     episode=episode,
                     step=0,
                     cycle_ms=0.0,
-                    detail=outcome,
+                    detail=stage_detail,
                 )
                 self._publish_zero()
                 if self.single_episode:

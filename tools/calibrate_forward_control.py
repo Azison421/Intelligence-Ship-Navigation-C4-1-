@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
 import math
 from pathlib import Path
@@ -27,6 +26,7 @@ from usvlib4ros.planning.forward_control_profile import (
     ForwardProbeSafetySample,
     action_protocol_hash,
     build_forward_control_profile,
+    forward_control_profile_to_dict,
     forward_probe_abort_reason,
     supplemental_turn_probe_controls,
 )
@@ -441,7 +441,7 @@ def main() -> int:
             {
                 "verdict": "calibrated",
                 "stop_reason": None,
-                "profile": asdict(profile),
+                "profile": forward_control_profile_to_dict(profile),
                 "action_protocol_hash": action_protocol_hash(profile),
             }
         )
