@@ -195,6 +195,10 @@ class FixedMapSACTrainer:
         self.sac.reduced_dynamics = reduced_dynamics_from_profile(forward_profile)
         self.replay = SequenceReplay(capacity=replay_capacity, seed=seed)
         self.completed_training_episodes = 0
+        self._context = build_fixed_route_context(
+            session_id=f"offline-training-{seed}",
+        )
+        self._laser = _StaticLaser(self._context.compiled_map.snapshot)
 
     def _randomized_dynamics(self, episode: int) -> PrototypeReducedDynamics:
         base = reduced_dynamics_from_profile(self.forward_profile)
@@ -375,14 +379,13 @@ class FixedMapSACTrainer:
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps <= 0:
             raise ValueError("max_steps must be positive")
         session_id = f"offline-{self.seed}-{episode}"
-        provisional = build_fixed_route_context(session_id=session_id)
+        provisional = self._context
         dynamics = self._randomized_dynamics(episode)
-        laser = _StaticLaser(provisional.compiled_map.snapshot)
         state, corridor_progress = self._initial_state(
             provisional,
             full_route=full_route,
             dynamics=dynamics,
-            laser=laser,
+            laser=self._laser,
         )
         segment_index = 0
         if not full_route:
@@ -424,7 +427,7 @@ class FixedMapSACTrainer:
         no_safe = False
 
         while True:
-            sample = self._runtime_input(state, laser)
+            sample = self._runtime_input(state, self._laser)
             try:
                 decision = core.step(sample)
             except Exception:
