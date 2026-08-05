@@ -23,6 +23,8 @@ from torch.nn import functional as F
 ACTION_COUNT = 5
 LASER_COUNT = 72
 CHECKPOINT_FORMAT = "recurrent-sac-v1"
+CHECKPOINT_FORMAT_V2 = "recurrent-sac-v2"
+LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3 = "local-waypoint-observation-v3"
 
 
 def _finite_tensor(tensor: Tensor, name: str) -> None:
@@ -130,6 +132,123 @@ class LocalObservationV2:
             *self.safety_features,
             *self.event_features,
             float(self.pose_age_s),
+        )
+
+    def tensor(self) -> Tensor:
+        return torch.tensor(self.to_vector(), dtype=torch.float32)
+
+
+@dataclass(frozen=True)
+class LocalWaypointObservationV3:
+    """Fixed 166-value observation shared by live control and training."""
+
+    laser_ranges: tuple[float, ...]
+    laser_valid_mask: tuple[bool, ...]
+    scan_age_s: float
+    pose_age_s: float
+    device_age_s: float
+    speed_mps: float
+    yaw_rate_rad_s: float
+    actual_throttle: float
+    actual_rudder: float
+    current_waypoint_body_xy: tuple[float, float]
+    next_waypoint_body_xy: tuple[float, float]
+    next_waypoint_valid: bool
+    mission_progress: float
+    corridor_cross_track_m: float
+    corridor_heading_error_rad: float
+    corridor_progress: float
+    map_clearance_m: float
+    safe_action_mask: tuple[bool, ...]
+    session_id: str
+    stamp_sim: float
+    hidden_reset: bool = False
+    schema_version: str = LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3
+
+    def __post_init__(self) -> None:
+        laser = _as_tuple(self.laser_ranges)
+        laser_mask = tuple(self.laser_valid_mask)
+        safe_mask = tuple(self.safe_action_mask)
+        current = _as_tuple(self.current_waypoint_body_xy)
+        next_waypoint = _as_tuple(self.next_waypoint_body_xy)
+        object.__setattr__(self, "laser_ranges", laser)
+        object.__setattr__(self, "laser_valid_mask", laser_mask)
+        object.__setattr__(self, "safe_action_mask", safe_mask)
+        object.__setattr__(self, "current_waypoint_body_xy", current)
+        object.__setattr__(self, "next_waypoint_body_xy", next_waypoint)
+        if len(laser) != LASER_COUNT or len(laser_mask) != LASER_COUNT:
+            raise ValueError(
+                "LocalWaypointObservationV3 requires 72 laser values and masks"
+            )
+        if any(type(value) is not bool for value in laser_mask):
+            raise ValueError("laser_valid_mask must contain booleans")
+        if len(safe_mask) != ACTION_COUNT or any(
+            type(value) is not bool for value in safe_mask
+        ):
+            raise ValueError("safe_action_mask must contain five booleans")
+        if len(current) != 2 or len(next_waypoint) != 2:
+            raise ValueError("waypoint body coordinates must contain x and y")
+        if type(self.next_waypoint_valid) is not bool:
+            raise ValueError("next_waypoint_valid must be boolean")
+        if type(self.hidden_reset) is not bool:
+            raise ValueError("hidden_reset must be boolean")
+        if self.schema_version != LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3:
+            raise ValueError("LocalWaypointObservationV3 schema is incompatible")
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("observation session is required")
+        values = (
+            *laser,
+            self.scan_age_s,
+            self.pose_age_s,
+            self.device_age_s,
+            self.speed_mps,
+            self.yaw_rate_rad_s,
+            self.actual_throttle,
+            self.actual_rudder,
+            *current,
+            *next_waypoint,
+            self.mission_progress,
+            self.corridor_cross_track_m,
+            self.corridor_heading_error_rad,
+            self.corridor_progress,
+            self.map_clearance_m,
+            self.stamp_sim,
+        )
+        if not all(isfinite(float(value)) for value in values):
+            raise ValueError("LocalWaypointObservationV3 values must be finite")
+        if min(self.scan_age_s, self.pose_age_s, self.device_age_s) < 0.0:
+            raise ValueError("observation ages must be non-negative")
+        if not 0.0 <= self.mission_progress <= 1.0:
+            raise ValueError("mission progress must be in [0, 1]")
+        if not 0.0 <= self.corridor_progress <= 1.0:
+            raise ValueError("corridor progress must be in [0, 1]")
+        if self.map_clearance_m < 0.0:
+            raise ValueError("map clearance must be non-negative")
+
+    @property
+    def feature_dim(self) -> int:
+        return 166
+
+    def to_vector(self) -> tuple[float, ...]:
+        return (
+            *self.laser_ranges,
+            *(1.0 if valid else 0.0 for valid in self.laser_valid_mask),
+            float(self.scan_age_s),
+            float(self.pose_age_s),
+            float(self.device_age_s),
+            float(self.speed_mps),
+            float(self.yaw_rate_rad_s),
+            float(self.actual_throttle),
+            float(self.actual_rudder),
+            *self.current_waypoint_body_xy,
+            *self.next_waypoint_body_xy,
+            1.0 if self.next_waypoint_valid else 0.0,
+            float(self.mission_progress),
+            float(self.corridor_cross_track_m),
+            float(self.corridor_heading_error_rad),
+            float(self.corridor_progress),
+            float(self.map_clearance_m),
+            *(1.0 if safe else 0.0 for safe in self.safe_action_mask),
         )
 
     def tensor(self) -> Tensor:
