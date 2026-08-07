@@ -23,6 +23,11 @@ from usvlib4ros.navigation.fixed_corridor import (
     DEFAULT_CORRIDOR_PATH,
     FrozenRouteCorridor,
 )
+from usvlib4ros.navigation.route_training_guide import (
+    GUIDED_ROUTE_WAYPOINTS,
+    SUFFIX_GOAL_TOLERANCE_M,
+    load_route_training_guide,
+)
 from usvlib4ros.navigation.waypoint_control import (
     ACTION_SCHEMA_V3,
     CHECKPOINT_SCHEMA_V6,
@@ -73,6 +78,36 @@ LASER_EMERGENCY_DISTANCE_M = 0.0
 MOTION_STALL_CYCLES = 30
 MOTION_STALL_DISTANCE_M = 0.05
 MOTION_STALL_SPEED_MPS = 0.03
+SPEED_NUMERICAL_ZERO_TOLERANCE_MPS = 1e-6
+SPEED_GOVERNOR_ENTRY_MPS = 0.30
+SPEED_GOVERNOR_COAST_MPS = 0.45
+SPEED_GOVERNOR_THROTTLE_CAP = 0.20
+MAP_INVALID_GRACE_RADIUS_M = 1.0
+MAP_INVALID_GRACE_MAX_CYCLES = 30
+MAP_INVALID_GRACE_P11_MAX_CYCLES = 60
+MAP_INVALID_GRACE_MAX_INCIDENTS = 1
+MAP_INVALID_GRACE_P11_MAX_INCIDENTS = 3
+RRT_HANDOFF_WAYPOINT_INDEX = 10
+RRT_SUFFIX_START_INDEX = 11
+RRT_HANDOFF_CONFIRMATION_RADIUS_M = 0.75
+
+
+def _distance_to_segment(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> float:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 0.0:
+        return math.dist(point, start)
+    ratio = (
+        (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
+    ) / length_squared
+    ratio = max(0.0, min(1.0, ratio))
+    nearest = (start[0] + ratio * dx, start[1] + ratio * dy)
+    return math.dist(point, nearest)
 
 
 def laser_emergency_distance_m(snapshot, state: VesselState) -> float:
@@ -314,13 +349,16 @@ class LiveInputAdapter:
                 x_enu,
                 y_enu,
             )
+            speed = float(getattr(pose, "speed", 0.0) or 0.0)
+            if -SPEED_NUMERICAL_ZERO_TOLERANCE_MPS <= speed < 0.0:
+                speed = 0.0
             state = VesselState(
                 x=x,
                 y=y,
                 yaw=compass_yaw_deg_to_math_yaw_rad(
                     float(getattr(pose, "yaw", 0.0) or 0.0)
                 ),
-                speed=float(getattr(pose, "speed", 0.0) or 0.0),
+                speed=speed,
                 yaw_rate=compass_yaw_rate_degs_to_math_rad_s(
                     float(getattr(pose, "rotate_speed", 0.0) or 0.0)
                 ),
@@ -367,11 +405,14 @@ class FixedMapControllerCore:
         *,
         dynamics: Optional[PrototypeReducedDynamics] = None,
         deterministic_policy: bool = True,
+        corridor_guidance: bool = False,
     ) -> None:
         if not isinstance(context, FixedRouteContext):
             raise ValueError("controller requires a National_Test context")
         if type(deterministic_policy) is not bool:
             raise ValueError("deterministic_policy must be boolean")
+        if type(corridor_guidance) is not bool:
+            raise ValueError("corridor_guidance must be boolean")
         profile = getattr(policy, "forward_control_profile", None)
         if not isinstance(profile, ForwardControlProfile):
             raise ValueError("SAC policy is missing its calibrated control profile")
@@ -380,6 +421,15 @@ class FixedMapControllerCore:
         self.context = context
         self.policy = policy
         self.deterministic_policy = deterministic_policy
+        self.corridor_guidance = corridor_guidance
+        self.route_guide = (
+            load_route_training_guide(
+                context.corridor.corridor_hash,
+                action_protocol_hash(profile),
+            )
+            if corridor_guidance
+            else None
+        )
         self.dynamics = dynamics or reduced_dynamics_from_profile(profile)
         self.controls = profile.action_controls
         self.candidates = tuple(
@@ -399,6 +449,13 @@ class FixedMapControllerCore:
         self._last_commanded_throttle = 0.0
         self._stall_origin_xy: Optional[tuple[float, float]] = None
         self._stall_cycles = 0
+        self._last_motion_decision: Optional[RuntimeDecision] = None
+        self._map_invalid_grace_incidents: dict[str, int] = {}
+        self._active_map_invalid_grace: Optional[str] = None
+        self._map_invalid_grace_cycles = 0
+        self._previous_state_xy: Optional[tuple[float, float]] = None
+        self._rrt_suffix_mission_index: Optional[int] = None
+        self._rrt_suffix_route_index = 0
 
     def _goal_xy(self) -> tuple[float, float]:
         if self.mission_index >= 13:
@@ -409,6 +466,42 @@ class FixedMapControllerCore:
         if not state.is_finite():
             return float("inf")
         return math.dist((state.x, state.y), self._goal_xy())
+
+    def _waypoint_reached(
+        self,
+        state: VesselState,
+        previous_xy: Optional[tuple[float, float]] = None,
+    ) -> bool:
+        if self.mission_index == RRT_HANDOFF_WAYPOINT_INDEX:
+            return (
+                math.dist(
+                    (state.x, state.y),
+                    self.context.corridor.task_points[
+                        RRT_HANDOFF_WAYPOINT_INDEX
+                    ],
+                )
+                <= RRT_HANDOFF_CONFIRMATION_RADIUS_M
+            )
+        if self.mission_index >= RRT_SUFFIX_START_INDEX:
+            goal = self.context.corridor.task_points[self.mission_index]
+            current = (state.x, state.y)
+            return (
+                math.dist(current, goal) <= SUFFIX_GOAL_TOLERANCE_M
+                or (
+                    previous_xy is not None
+                    and _distance_to_segment(
+                        goal,
+                        previous_xy,
+                        current,
+                    )
+                    <= SUFFIX_GOAL_TOLERANCE_M
+                )
+            )
+        return fixed_route_waypoint_reached(
+            self.context.compiled_map,
+            self.mission_index,
+            state,
+        )
 
     def _stop(
         self,
@@ -426,6 +519,10 @@ class FixedMapControllerCore:
         candidate_clearances_m: tuple[float, ...] = (0.0,) * 5,
     ) -> RuntimeDecision:
         self._last_commanded_throttle = 0.0
+        self._last_motion_decision = None
+        self._active_map_invalid_grace = None
+        self._map_invalid_grace_cycles = 0
+        self._previous_state_xy = None
         return RuntimeDecision(
             reason=reason,
             control=None,
@@ -446,6 +543,99 @@ class FixedMapControllerCore:
             observation=observation,
             candidate_reasons=candidate_reasons,
             candidate_clearances_m=candidate_clearances_m,
+        )
+
+    def _map_invalid_grace_zone(self, state: VesselState) -> Optional[str]:
+        point = (state.x, state.y)
+        task_points = self.context.corridor.task_points
+        if self.mission_index in (2, 3) and _distance_to_segment(
+            point,
+            task_points[1],
+            task_points[2],
+        ) <= MAP_INVALID_GRACE_RADIUS_M:
+            return "P2_P3"
+        if self.mission_index in (4, 5) and _distance_to_segment(
+            point,
+            task_points[3],
+            task_points[4],
+        ) <= MAP_INVALID_GRACE_RADIUS_M:
+            return "P4_P5"
+        if self.mission_index in (7, 8) and _distance_to_segment(
+            point,
+            task_points[6],
+            task_points[7],
+        ) <= MAP_INVALID_GRACE_RADIUS_M:
+            return "P7_P8"
+        if self.mission_index in (9, 10) and _distance_to_segment(
+            point,
+            task_points[8],
+            task_points[9],
+        ) <= MAP_INVALID_GRACE_RADIUS_M:
+            return "P9_P10"
+        if self.mission_index in (10, 11) and math.dist(
+            point,
+            task_points[10],
+        ) <= MAP_INVALID_GRACE_RADIUS_M:
+            return "P11"
+        if (
+            self.route_guide is not None
+            and self.mission_index in (11, 12)
+            and self.route_guide.distance_to_suffix(
+                11,
+                state.x,
+                state.y,
+            )
+            <= MAP_INVALID_GRACE_RADIUS_M
+        ):
+            return "P11"
+        return None
+
+    def _map_invalid_grace(
+        self,
+        state: VesselState,
+    ) -> Optional[RuntimeDecision]:
+        zone = self._map_invalid_grace_zone(state)
+        previous = self._last_motion_decision
+        if zone is None or previous is None or previous.control is None:
+            return None
+        max_cycles = (
+            MAP_INVALID_GRACE_P11_MAX_CYCLES
+            if zone == "P11"
+            else MAP_INVALID_GRACE_MAX_CYCLES
+        )
+        max_incidents = (
+            MAP_INVALID_GRACE_P11_MAX_INCIDENTS
+            if zone == "P11"
+            else MAP_INVALID_GRACE_MAX_INCIDENTS
+        )
+        if self._active_map_invalid_grace == zone:
+            if self._map_invalid_grace_cycles >= max_cycles:
+                return None
+            self._map_invalid_grace_cycles += 1
+        elif self._map_invalid_grace_incidents.get(zone, 0) < max_incidents:
+            self._map_invalid_grace_incidents[zone] = (
+                self._map_invalid_grace_incidents.get(zone, 0) + 1
+            )
+            self._active_map_invalid_grace = zone
+            self._map_invalid_grace_cycles = 1
+        else:
+            return None
+        self._last_commanded_throttle = previous.control.throttle
+        return RuntimeDecision(
+            reason=f"MAP_INVALID_GRACE_{zone}",
+            control=previous.control,
+            action=previous.action,
+            policy_action=previous.policy_action,
+            mission_index=self.mission_index,
+            distance_to_goal_m=self._distance(state),
+            advised_heading_deg=previous.advised_heading_deg,
+            safe_mask=previous.safe_mask,
+            reachability_mask=previous.reachability_mask,
+            completed=False,
+            safety_intervened=True,
+            safety_truncated=False,
+            candidate_reasons=previous.candidate_reasons,
+            candidate_clearances_m=previous.candidate_clearances_m,
         )
 
     def _motion_stalled(self, state: VesselState) -> bool:
@@ -547,31 +737,15 @@ class FixedMapControllerCore:
         if not self.dynamics.is_state_valid(state):
             self.no_safe_actions.reset()
             return self._stop("DYNAMICS_INVALID", state)
-        snapshot = self.context.compiled_map.snapshot
-        if not snapshot.is_state_valid(state):
-            self.no_safe_actions.reset()
-            return self._stop("MAP_INVALID", state)
-        laser_stop_distance = laser_emergency_distance_m(snapshot, state)
-        if any(
-            valid
-            and (
-                not math.isfinite(float(distance))
-                or float(distance) <= laser_stop_distance
-            )
-            for distance, valid in zip(
-                sample.laser_ranges,
-                sample.laser_valid_mask,
-            )
-        ):
-            self.no_safe_actions.reset()
-            return self._stop("LASER_EMERGENCY_STOP", state)
 
-        while self.mission_index < 13 and fixed_route_waypoint_reached(
-            self.context.compiled_map,
-            self.mission_index,
+        previous_xy = self._previous_state_xy
+        while self.mission_index < 13 and self._waypoint_reached(
             state,
+            previous_xy,
         ):
             self.mission_index += 1
+            previous_xy = None
+        self._previous_state_xy = (state.x, state.y)
         if self.mission_index == 13:
             self.no_safe_actions.reset()
             projection = self.context.corridor.project(
@@ -592,6 +766,30 @@ class FixedMapControllerCore:
                 completed=True,
                 observation=observation,
             )
+
+        snapshot = self.context.compiled_map.snapshot
+        laser_stop_distance = laser_emergency_distance_m(snapshot, state)
+        if any(
+            valid
+            and (
+                not math.isfinite(float(distance))
+                or float(distance) <= laser_stop_distance
+            )
+            for distance, valid in zip(
+                sample.laser_ranges,
+                sample.laser_valid_mask,
+            )
+        ):
+            self.no_safe_actions.reset()
+            return self._stop("LASER_EMERGENCY_STOP", state)
+        if not snapshot.is_state_valid(state):
+            self.no_safe_actions.reset()
+            grace = self._map_invalid_grace(state)
+            if grace is not None:
+                return grace
+            return self._stop("MAP_INVALID", state)
+        self._active_map_invalid_grace = None
+        self._map_invalid_grace_cycles = 0
 
         projection = self.context.corridor.project(
             state,
@@ -668,8 +866,28 @@ class FixedMapControllerCore:
                 safety_intervened=True,
                 observation=observation,
             )
+        guided_action = proposal.action
+        if (
+            self.corridor_guidance
+            and RRT_SUFFIX_START_INDEX
+            <= self.mission_index
+            < GUIDED_ROUTE_WAYPOINTS
+        ):
+            if self._rrt_suffix_mission_index != self.mission_index:
+                self._rrt_suffix_mission_index = self.mission_index
+                self._rrt_suffix_route_index = 0
+            guided_action, self._rrt_suffix_route_index = (
+                self.route_guide.suffix_action(
+                    self.mission_index,
+                    state.x,
+                    state.y,
+                    state.yaw,
+                    safe_mask,
+                    start_index=self._rrt_suffix_route_index,
+                )
+            )
         final = self.supervisor.finalize(
-            policy_action=proposal.action,
+            policy_action=guided_action,
             candidate_mask=safe_mask,
             candidates=self.candidates,
             snapshot_id=snapshot.snapshot_id,
@@ -706,32 +924,59 @@ class FixedMapControllerCore:
                 candidate_clearances_m=clearances,
             )
 
+        distance_to_goal = self._distance(state)
+        governed_throttle = final.control.throttle
+        if state.speed >= SPEED_GOVERNOR_COAST_MPS:
+            governed_throttle = 0.0
+        elif state.speed >= SPEED_GOVERNOR_ENTRY_MPS:
+            governed_throttle = min(
+                governed_throttle,
+                SPEED_GOVERNOR_THROTTLE_CAP,
+            )
+        speed_governed = governed_throttle != final.control.throttle
+        final_control = Control(
+            throttle=governed_throttle,
+            rudder=final.control.rudder,
+        )
         self.transition_guard.record_executed(final.final_action)
-        self._last_commanded_throttle = final.control.throttle
+        self._last_commanded_throttle = final_control.throttle
         self.hidden = next_hidden
         self.hidden_reset = False
         desired_yaw = state.yaw + projection.heading_error_rad
-        intervened = bool(final.overridden) or proposal.action != final.final_action
+        intervened = (
+            bool(final.overridden)
+            or proposal.action != final.final_action
+            or speed_governed
+        )
+        guidance_intervened = guided_action != proposal.action
         trace = RuntimeTrainingTrace(
             observation=observation,
             policy_action=proposal.action,
             executed_action=final.final_action,
             safe_action_mask=tuple(final.candidate_mask),
             reachability_mask=reachability,
-            final_control=final.control,
+            final_control=final_control,
             mission_index=self.mission_index,
-            distance_to_goal_m=self._distance(state),
+            distance_to_goal_m=distance_to_goal,
             cross_track_error_m=projection.cross_track_error_m,
             map_clearance_m=snapshot.clearance_at(state),
             safety_intervened=intervened,
         )
-        return RuntimeDecision(
-            reason=final.reason,
-            control=final.control,
+        decision = RuntimeDecision(
+            reason=(
+                "SPEED_GOVERNOR"
+                if speed_governed
+                else (
+                    "ROUTE_TRAINING_GUIDANCE_OVERRIDE"
+                    if guidance_intervened
+                    else final.reason
+                )
+            ),
+            control=final_control,
             action=final.final_action,
             policy_action=proposal.action,
             mission_index=self.mission_index,
-            distance_to_goal_m=self._distance(state),
+            distance_to_goal_m=distance_to_goal,
             advised_heading_deg=math_yaw_rad_to_compass_deg(desired_yaw),
             safe_mask=tuple(final.candidate_mask),
             reachability_mask=reachability,
@@ -743,6 +988,8 @@ class FixedMapControllerCore:
             candidate_reasons=tuple(final.reasons),
             candidate_clearances_m=clearances,
         )
+        self._last_motion_decision = decision
+        return decision
 
 
 __all__ = [

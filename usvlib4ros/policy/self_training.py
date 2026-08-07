@@ -55,6 +55,7 @@ OFFLINE_BLOCK_EPISODES = 100
 OFFLINE_EVALUATION_EPISODES = 20
 UNITY_ADAPT_EPISODES = 5
 UNITY_VALIDATION_EPISODES = 5
+UNITY_REPLAY_CAPACITY = 1024
 MAX_TRAINING_EPISODES = 1_000
 
 
@@ -802,7 +803,9 @@ class UnityTransitionRecorder:
             "LASER_EMERGENCY_STOP",
             "POLICY_NO_ACTION",
         }
-        if self._pending is not None and (decision.control is not None or terminal):
+        if self._pending is not None and (
+            decision.training_trace is not None or terminal
+        ):
             self._finalize(
                 decision,
                 terminated=terminal,
@@ -858,10 +861,19 @@ def train_from_unity_episode(
 ) -> Optional[TrainingDiagnostics]:
     if not transitions:
         return None
+    online_learning_rate = 3e-5
+    for optimizer in (
+        trainer.sac.actor_optimizer,
+        trainer.sac.critic1_optimizer,
+        trainer.sac.critic2_optimizer,
+    ):
+        optimizer.defaults["lr"] = online_learning_rate
+        for group in optimizer.param_groups:
+            group["lr"] = online_learning_rate
     return trainer.learn_from_episode(
         transitions,
-        maximum_updates=64,
-        transitions_per_update=2,
+        maximum_updates=1,
+        transitions_per_update=128,
         demonstration=False,
     )
 
@@ -882,6 +894,10 @@ class UnityTrainingGate:
         )
         self.last_training_diagnostics: Optional[TrainingDiagnostics] = None
         self.cursor, self.trainer = state_store.restore_trainer()
+        self.trainer.replay.capacity = max(
+            self.trainer.replay.capacity,
+            UNITY_REPLAY_CAPACITY,
+        )
         if self.cursor.stage not in {
             SelfTrainingStage.UNITY_ADAPT,
             SelfTrainingStage.UNITY_VALIDATION,
@@ -895,7 +911,7 @@ class UnityTrainingGate:
 
     @property
     def deterministic(self) -> bool:
-        return self.cursor.stage is SelfTrainingStage.UNITY_VALIDATION
+        return True
 
     def _save_new_active(self) -> None:
         checkpoint, self.cursor = save_stage_checkpoint(
@@ -977,26 +993,17 @@ class UnityTrainingGate:
             self._save_new_active()
             return self.cursor
 
-        failed_checkpoint = self.checkpoint_dir / str(
+        checkpoint = self.checkpoint_dir / str(
             self.cursor.active_checkpoint
         )
-        failed_cursor = replace(
-            self.cursor,
-            stage=SelfTrainingStage.OFFLINE_TRAIN,
-        )
-        update_checkpoint_stage(failed_checkpoint, failed_cursor)
-        self.registry.path.unlink(missing_ok=True)
         self.cursor = replace(
-            failed_cursor,
-            generation=failed_cursor.generation + 1,
-            offline_block_progress=0,
-            offline_evaluations=0,
-            offline_evaluation_passes=0,
-            unity_adapt_episodes=0,
+            self.cursor,
+            stage=SelfTrainingStage.UNITY_ADAPT,
             unity_validation_episodes=0,
             unity_validation_passes=0,
-            active_checkpoint=None,
         )
+        update_checkpoint_stage(checkpoint, self.cursor)
+        self.registry.write(checkpoint, self.cursor.stage)
         self.state_store.save(self.cursor, self.trainer)
         return self.cursor
 

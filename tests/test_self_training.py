@@ -10,6 +10,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from usvlib4ros.navigation.fixed_map_runtime import (
+    RuntimeDecision,
+    RuntimeTrainingTrace,
+)
 from usvlib4ros.navigation.fixed_map_service import FixedMapNavigationService
 from usvlib4ros.planning import Control
 from usvlib4ros.policy.fixed_map_trainer import (
@@ -17,7 +21,10 @@ from usvlib4ros.policy.fixed_map_trainer import (
     control_transition_reward,
 )
 from usvlib4ros.policy import self_training
-from usvlib4ros.policy.recurrent_sac import LocalWaypointObservationV3
+from usvlib4ros.policy.recurrent_sac import (
+    LocalWaypointObservationV3,
+    SequenceReplay,
+)
 from usvlib4ros.policy.self_training import (
     ActiveCheckpointRegistry,
     OFFLINE_BLOCK_EPISODES,
@@ -26,6 +33,7 @@ from usvlib4ros.policy.self_training import (
     TrainingCursor,
     UNITY_ADAPT_EPISODES,
     UNITY_VALIDATION_EPISODES,
+    UnityTransitionRecorder,
     UnityTrainingGate,
 )
 
@@ -198,6 +206,9 @@ def test_unity_reset_rearms_an_inactive_training_task():
 def _reward_observation(
     distance_to_waypoint: float,
     safe_mask: tuple[bool, ...],
+    *,
+    speed_mps: float = 0.2,
+    heading_error_rad: float = 0.0,
 ) -> LocalWaypointObservationV3:
     return LocalWaypointObservationV3(
         laser_ranges=(20.0,) * 72,
@@ -205,7 +216,7 @@ def _reward_observation(
         scan_age_s=0.0,
         pose_age_s=0.0,
         device_age_s=0.0,
-        speed_mps=0.2,
+        speed_mps=speed_mps,
         yaw_rate_rad_s=0.0,
         actual_throttle=0.1,
         actual_rudder=0.0,
@@ -214,7 +225,7 @@ def _reward_observation(
         next_waypoint_valid=True,
         mission_progress=0.0,
         corridor_cross_track_m=0.1,
-        corridor_heading_error_rad=0.0,
+        corridor_heading_error_rad=heading_error_rad,
         corridor_progress=0.1,
         map_clearance_m=1.0,
         safe_action_mask=safe_mask,
@@ -258,6 +269,117 @@ def test_reward_prefers_waypoint_progress_and_preserved_safety_margin():
 
     assert safer_reward > riskier_reward
 
+    slow_turn = _reward_observation(
+        1.5,
+        (True,) * 5,
+        speed_mps=0.2,
+        heading_error_rad=0.25,
+    )
+    fast_turn = _reward_observation(
+        1.5,
+        (True,) * 5,
+        speed_mps=0.8,
+        heading_error_rad=0.25,
+    )
+    slow_turn_reward = control_transition_reward(
+        observation,
+        slow_turn,
+        control,
+        control,
+        mission_delta=0,
+        completed=False,
+        terminated=False,
+        truncated=False,
+        reason="STEP",
+    )
+    fast_turn_reward = control_transition_reward(
+        observation,
+        fast_turn,
+        control,
+        control,
+        mission_delta=0,
+        completed=False,
+        terminated=False,
+        truncated=False,
+        reason="STEP",
+    )
+
+    assert slow_turn_reward > fast_turn_reward
+
+
+def test_unity_recorder_keeps_pending_action_until_untraceable_terminal():
+    observation = _reward_observation(2.0, (True,) * 5)
+    control = Control(0.1, 0.0)
+    trace = RuntimeTrainingTrace(
+        observation=observation,
+        policy_action=2,
+        executed_action=2,
+        safe_action_mask=(True,) * 5,
+        reachability_mask=(True,) * 5,
+        final_control=control,
+        mission_index=7,
+        distance_to_goal_m=2.0,
+        cross_track_error_m=0.1,
+        map_clearance_m=1.0,
+        safety_intervened=False,
+    )
+    recorder = UnityTransitionRecorder()
+    recorder.observe(
+        RuntimeDecision(
+            reason="POLICY",
+            control=control,
+            action=2,
+            policy_action=2,
+            mission_index=7,
+            distance_to_goal_m=2.0,
+            advised_heading_deg=0.0,
+            safe_mask=(True,) * 5,
+            reachability_mask=(True,) * 5,
+            completed=False,
+            safety_intervened=False,
+            safety_truncated=False,
+            observation=observation,
+            training_trace=trace,
+        )
+    )
+    recorder.observe(
+        RuntimeDecision(
+            reason="MAP_INVALID_GRACE_P7_P8",
+            control=control,
+            action=2,
+            policy_action=2,
+            mission_index=7,
+            distance_to_goal_m=2.0,
+            advised_heading_deg=0.0,
+            safe_mask=(True,) * 5,
+            reachability_mask=(True,) * 5,
+            completed=False,
+            safety_intervened=True,
+            safety_truncated=False,
+        )
+    )
+    recorder.observe(
+        RuntimeDecision(
+            reason="MAP_INVALID",
+            control=None,
+            action=None,
+            policy_action=None,
+            mission_index=7,
+            distance_to_goal_m=2.0,
+            advised_heading_deg=0.0,
+            safe_mask=(False,) * 5,
+            reachability_mask=(False,) * 5,
+            completed=False,
+            safety_intervened=False,
+            safety_truncated=False,
+        )
+    )
+
+    assert len(recorder.transitions) == 1
+    assert recorder.transitions[-1].terminated
+    assert recorder.transitions[-1].reason == "MAP_INVALID"
+    SequenceReplay().add_episode(recorder.transitions)
+
 
 def test_unity_gate_adapts_until_a_full_route_pass_then_freezes(
     tmp_path: Path,
@@ -281,7 +403,12 @@ def test_unity_gate_adapts_until_a_full_route_pass_then_freezes(
         offline_evaluation_passes=20,
         active_checkpoint=active.name,
     )
-    trainer = SimpleNamespace(replay=SimpleNamespace(add_episode=lambda _: None))
+    trainer = SimpleNamespace(
+        replay=SimpleNamespace(
+            capacity=64,
+            add_episode=lambda _: None,
+        )
+    )
     store = _Store(cursor, trainer)
     updates = []
     checkpoint_index = 0
@@ -309,6 +436,8 @@ def test_unity_gate_adapts_until_a_full_route_pass_then_freezes(
     monkeypatch.setattr(self_training, "update_checkpoint_stage", lambda *_: None)
 
     gate = UnityTrainingGate(state_store=store, checkpoint_dir=tmp_path)
+    assert gate.deterministic is True
+    assert gate.trainer.replay.capacity == 1024
     for _ in range(UNITY_ADAPT_EPISODES):
         gate.finish_episode(
             (),
@@ -343,3 +472,54 @@ def test_unity_gate_adapts_until_a_full_route_pass_then_freezes(
     assert gate.cursor.stage is SelfTrainingStage.PROMOTED
     assert gate.cursor.unity_validation_passes == 5
     assert len(updates) == 6
+
+
+def test_failed_unity_validation_resumes_adapt_with_same_checkpoint(
+    tmp_path: Path,
+):
+    active = tmp_path / "active.pt"
+    active.write_bytes(b"candidate")
+    _write_manifest(
+        active,
+        SelfTrainingStage.UNITY_VALIDATION,
+        offline_passes=20,
+        unity_adapt=337,
+    )
+    registry = ActiveCheckpointRegistry(
+        tmp_path / "national_test_sac_active.json"
+    )
+    registry.write(active, SelfTrainingStage.UNITY_VALIDATION)
+    cursor = TrainingCursor(
+        seed=19,
+        stage=SelfTrainingStage.UNITY_VALIDATION,
+        completed_training_episodes=100,
+        offline_evaluations=20,
+        offline_evaluation_passes=20,
+        unity_adapt_episodes=337,
+        active_checkpoint=active.name,
+    )
+    trainer = SimpleNamespace(
+        replay=SimpleNamespace(
+            capacity=64,
+            add_episode=lambda _: None,
+        )
+    )
+    gate = UnityTrainingGate(
+        state_store=_Store(cursor, trainer),
+        checkpoint_dir=tmp_path,
+    )
+
+    for _ in range(UNITY_VALIDATION_EPISODES):
+        gate.finish_episode(
+            (),
+            counted=True,
+            passed=False,
+            operator_truncated=False,
+        )
+
+    assert gate.cursor.stage is SelfTrainingStage.UNITY_ADAPT
+    assert gate.cursor.active_checkpoint == active.name
+    assert gate.cursor.unity_adapt_episodes == 337
+    assert gate.cursor.unity_validation_episodes == 0
+    assert gate.cursor.unity_validation_passes == 0
+    assert registry.resolve(active) == active

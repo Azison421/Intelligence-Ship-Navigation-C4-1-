@@ -65,6 +65,7 @@ def _chart(
     if y_min == y_max:
         y_min -= 1.0
         y_max += 1.0
+    x_precision = 1 if x_max - x_min < 5.0 else 0
     padding = 0.05 * (y_max - y_min)
     y_min -= padding
     y_max += padding
@@ -93,7 +94,7 @@ def _chart(
         lines.extend(
             (
                 f'<line x1="{x:.2f}" y1="{top + plot_height}" x2="{x:.2f}" y2="{top + plot_height + 5}" stroke="#303030"/>',
-                f'<text x="{x:.2f}" y="{top + plot_height + 22}" text-anchor="middle" font-size="11">{x_value:.0f}</text>',
+                f'<text x="{x:.2f}" y="{top + plot_height + 22}" text-anchor="middle" font-size="11">{x_value:.{x_precision}f}</text>',
                 f'<line x1="{left - 5}" y1="{y:.2f}" x2="{left}" y2="{y:.2f}" stroke="#303030"/>',
                 f'<text x="{left - 10}" y="{y + 4:.2f}" text-anchor="end" font-size="11">{y_value:.2f}</text>',
             )

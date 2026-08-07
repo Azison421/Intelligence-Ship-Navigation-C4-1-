@@ -333,6 +333,7 @@ class FixedMapNavigationService:
         *,
         policy=None,
         deterministic_policy: Optional[bool] = None,
+        corridor_guidance: bool = False,
     ) -> tuple[str, tuple]:
         if self._wait_for_pose() is None:
             return "SERVICE_STOPPED", ()
@@ -351,10 +352,13 @@ class FixedMapNavigationService:
         )
         if type(deterministic) is not bool:
             raise ValueError("deterministic policy flag must be boolean")
+        if type(corridor_guidance) is not bool:
+            raise ValueError("corridor guidance flag must be boolean")
         core = FixedMapControllerCore(
             context,
             active_policy,
             deterministic_policy=deterministic,
+            corridor_guidance=corridor_guidance,
         )
         adapter = LiveInputAdapter(self.global_data, context)
         recorder = UnityTransitionRecorder()
@@ -490,6 +494,7 @@ class FixedMapNavigationService:
                         if unity_gate is not None
                         else None
                     ),
+                    corridor_guidance=True,
                 )
                 stage_detail = outcome
                 reset_required = False
@@ -503,9 +508,10 @@ class FixedMapNavigationService:
                     validation_passes = (
                         unity_gate.cursor.unity_validation_passes
                     )
-                    counted = outcome not in {
+                    counted = bool(transitions) and outcome not in {
                         "CONTROLLER_EXCEPTION",
                         "CONTROL_DEADLINE_MISSED",
+                        "DYNAMICS_INVALID",
                         "INPUT_STALE",
                         "OPERATOR_TRUNCATED",
                         "SERVICE_STOPPED",
@@ -526,9 +532,9 @@ class FixedMapNavigationService:
                             outcome == "OPERATOR_TRUNCATED"
                         ),
                     )
-                    reset_required = counted and (
-                        cursor.stage is not SelfTrainingStage.PROMOTED
-                    )
+                    reset_required = (
+                        counted or outcome in {"DYNAMICS_INVALID", "MAP_INVALID"}
+                    ) and cursor.stage is not SelfTrainingStage.PROMOTED
                     if cursor.active_checkpoint is not None:
                         self.checkpoint_path = (
                             DEFAULT_CHECKPOINT.parent

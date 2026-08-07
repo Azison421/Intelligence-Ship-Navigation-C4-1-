@@ -18,9 +18,18 @@ from usvlib4ros.navigation.fixed_map_runtime import (
     build_fixed_route_context,
     laser_emergency_distance_m,
 )
+from usvlib4ros.navigation.route_training_guide import (
+    GUIDED_ROUTE_WAYPOINTS,
+    FrozenRouteTrainingGuide,
+    load_route_training_guide,
+)
+from usvlib4ros.navigation.waypoint_control import (
+    HARD_TURN_ERROR_RAD,
+)
 from usvlib4ros.planning import Control, PrototypeReducedDynamics, VesselState
 from usvlib4ros.planning.forward_control_profile import (
     ForwardControlProfile,
+    action_protocol_hash,
     reduced_dynamics_from_profile,
 )
 from usvlib4ros.planning.fixed_route import fixed_route_waypoint_reached
@@ -99,6 +108,13 @@ def control_transition_reward(
     reward += 0.1 * (next_safe - current_safe)
     reward -= 0.08 * abs(next_observation.corridor_heading_error_rad)
     reward -= 0.2 * abs(next_observation.corridor_cross_track_m)
+    turn_demand = min(
+        1.0,
+        abs(next_observation.corridor_heading_error_rad)
+        / HARD_TURN_ERROR_RAD,
+    )
+    reward -= 0.75 * next_observation.speed_mps * turn_demand
+    reward -= 0.4 * abs(control.throttle) * turn_demand
     reward -= (
         0.5
         * next_observation.speed_mps
@@ -174,44 +190,32 @@ class _PendingAction:
     previous_control: Control
 
 
-def _guided_corridor_action(
-    cross_track_m: float,
-    heading_error_rad: float,
-    safe_action_mask: tuple[bool, ...],
-) -> int:
-    error = heading_error_rad - math.atan(0.5 * cross_track_m)
-    if error > 0.3:
-        preference = (0, 1, 2, 3, 4)
-    elif error > 0.06:
-        preference = (1, 0, 2, 3, 4)
-    elif error < -0.3:
-        preference = (4, 3, 2, 1, 0)
-    elif error < -0.06:
-        preference = (3, 4, 2, 1, 0)
-    else:
-        preference = (2, 1, 3, 0, 4)
-    return next(action for action in preference if safe_action_mask[action])
-
-
 class _GuidedExplorationPolicy:
     """Use the frozen corridor to seed early off-policy exploration."""
 
     def __init__(
         self,
         sac: RecurrentDiscreteSAC,
+        route_guide: FrozenRouteTrainingGuide,
     ) -> None:
         self.sac = sac
+        self.route_guide = route_guide
         self.forward_control_profile = sac.forward_control_profile
         self.action_schema = sac.action_schema
 
-    @staticmethod
     def _guided_action(
+        self,
         observation: LocalWaypointObservationV3,
         safe_action_mask: tuple[bool, ...],
     ) -> int:
-        return _guided_corridor_action(
+        mission_index = int(round(observation.mission_progress * 12.0))
+        return self.route_guide.action(
+            mission_index,
+            observation.corridor_progress,
             observation.corridor_cross_track_m,
             observation.corridor_heading_error_rad,
+            observation.speed_mps,
+            observation.yaw_rate_rad_s,
             safe_action_mask,
         )
 
@@ -230,7 +234,8 @@ class _GuidedExplorationPolicy:
             deterministic=deterministic,
         )
         mask = tuple(safe_action_mask)
-        if not deterministic:
+        mission_index = int(round(observation.mission_progress * 12.0))
+        if not deterministic and mission_index < GUIDED_ROUTE_WAYPOINTS:
             proposal = replace(
                 proposal,
                 action=self._guided_action(observation, mask),
@@ -337,21 +342,31 @@ class FixedMapSACTrainer:
         self._context = build_fixed_route_context(
             session_id=f"offline-training-{seed}",
         )
+        self._route_guide = load_route_training_guide(
+            self._context.corridor.corridor_hash,
+            action_protocol_hash(forward_profile),
+        )
         self._laser = _StaticLaser(self._context.compiled_map.snapshot)
 
-    @staticmethod
-    def _expert_actions(batch: ReplaySequenceBatch) -> torch.Tensor:
+    def _expert_actions(self, batch: ReplaySequenceBatch) -> torch.Tensor:
         expert_actions = batch.actions.clone()
         valid = ~batch.padding_mask & batch.safe_action_mask.any(dim=-1)
         for row, column in torch.nonzero(valid, as_tuple=False).tolist():
             observation = batch.observations[row, column]
+            mission_index = int(round(float(observation[156].item()) * 12.0))
+            if mission_index >= GUIDED_ROUTE_WAYPOINTS:
+                continue
             safe_mask = tuple(
                 bool(value)
                 for value in batch.safe_action_mask[row, column].tolist()
             )
-            expert_actions[row, column] = _guided_corridor_action(
+            expert_actions[row, column] = self._route_guide.action(
+                mission_index,
+                float(observation[159].item()),
                 float(observation[157].item()),
                 float(observation[158].item()),
+                float(observation[147].item()),
+                float(observation[148].item()),
                 safe_mask,
             )
         return expert_actions
@@ -643,7 +658,7 @@ class FixedMapSACTrainer:
             and self.completed_training_episodes < GUIDED_REPLAY_EPISODES
         )
         policy = (
-            _GuidedExplorationPolicy(self.sac)
+            _GuidedExplorationPolicy(self.sac, self._route_guide)
             if guided_replay
             else self.sac
         )

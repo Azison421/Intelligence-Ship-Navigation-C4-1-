@@ -11,6 +11,9 @@ from usvlib4ros.navigation.fixed_corridor import (
     FROZEN_CORRIDOR_SCHEMA,
     FrozenRouteCorridor,
 )
+from usvlib4ros.navigation.route_training_guide import (
+    load_route_training_guide,
+)
 from usvlib4ros.navigation.waypoint_control import (
     ACTION_SCHEMA_V3,
     CHECKPOINT_SCHEMA_V6,
@@ -23,7 +26,10 @@ from usvlib4ros.planning.fixed_route import (
     compile_offline_national_map,
     fixed_route_goal_xy,
 )
-from usvlib4ros.planning.forward_control_profile import ForwardControlProfile
+from usvlib4ros.planning.forward_control_profile import (
+    ForwardControlProfile,
+    action_protocol_hash,
+)
 from usvlib4ros.planning.kinodynamic_informed_rrtstar import Control, VesselState
 from usvlib4ros.policy.recurrent_sac import LocalWaypointObservationV3
 
@@ -87,6 +93,57 @@ def test_local_waypoint_observation_v3_has_fixed_166_value_contract():
     assert vector[151:157] == pytest.approx((1.0, 2.0, 3.0, 4.0, 1.0, 0.25))
     assert vector[157:161] == pytest.approx((-0.4, 0.15, 0.5, 1.2))
     assert vector[161:166] == pytest.approx((1.0, 0.0, 1.0, 0.0, 1.0))
+
+
+def test_frozen_route_guide_replays_unity_and_rrt_actions():
+    compiled = compile_offline_national_map(
+        session_id="prefix-elite-guide",
+        required_clearance_m=0.0,
+    )
+    corridor = FrozenRouteCorridor.load(DEFAULT_CORRIDOR_PATH, compiled)
+    guide = load_route_training_guide(
+        corridor.corridor_hash,
+        action_protocol_hash(_calibrated_profile()),
+    )
+
+    action = guide.action(
+        0,
+        0.000853205,
+        -0.126541456,
+        0.136624539,
+        0.016761746,
+        -0.0,
+        (True,) * 5,
+    )
+
+    assert guide.sample_count == 3216
+    assert len(guide.source_sessions) == 3
+    assert len(guide.suffix_plans) == 2
+    assert action == 1
+    for suffix, goal_index in zip(guide.suffix_plans, (11, 12)):
+        route = suffix["route_xy"]
+        goal = corridor.task_points[goal_index]
+        assert suffix["goal_tolerance_m"] == pytest.approx(0.5)
+        assert suffix["terminal_position_error_m"] <= 0.5
+        assert math.dist(route[-1], goal) <= 0.5
+        assert len(suffix["route_actions"]) == len(route)
+
+        start = route[0]
+        next_point = route[1]
+        tracked_action, route_index = guide.suffix_action(
+            suffix["mission_index"],
+            start[0],
+            start[1],
+            math.atan2(
+                next_point[1] - start[1],
+                next_point[0] - start[0],
+            ),
+            (True,) * 5,
+            start_index=0,
+        )
+
+        assert 0 <= tracked_action < 5
+        assert route_index >= 0
 
 
 def test_five_calibrated_controls_are_percent_unique_and_two_sided():

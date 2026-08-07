@@ -1,0 +1,6 @@
+{
+  "checkpoint": "national_test_sac_v6_seed20260805_g1_t70_unity_validation_a346_v0.pt",
+  "checkpoint_sha256": "7f28a95f80e583f260762d3e1da9751c7232402d891fccbd55aaa8ca07ffc352",
+  "schema_version": "national-test-active-checkpoint-v3",
+  "stage": "UNITY_VALIDATION"
+}

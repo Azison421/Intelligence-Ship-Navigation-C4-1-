@@ -13,6 +13,7 @@ from usvlib4ros.policy.recurrent_sac import (
 OBSERVATION_SCHEMA_V3 = LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3
 CHECKPOINT_SCHEMA_V6 = "national-test-sac-checkpoint-v6"
 REPLAY_SCHEMA_V3 = "national-test-replay-v3"
+HARD_TURN_ERROR_RAD = 0.2
 
 
 class ActuatorTransitionGuard:

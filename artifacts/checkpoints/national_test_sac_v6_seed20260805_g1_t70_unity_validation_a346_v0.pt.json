@@ -1,0 +1,68 @@
+{
+  "action_dim": 5,
+  "action_schema": "five-calibrated-controls-v3",
+  "calibration": {
+    "action_protocol_hash": "6e5de8b3320b1098436aab817f2608e474608910d45eb88e361447601eef03f8",
+    "calibration_hash": "4ab29d8494a09c5b68e77c6b65043b07d3366fa5df6220868a7dc959b343e684",
+    "status": "verified"
+  },
+  "checkpoint_sha256": "7f28a95f80e583f260762d3e1da9751c7232402d891fccbd55aaa8ca07ffc352",
+  "corridor_sha256": "58a7b68761176f88ca88e582f5efc48f71dc4e33adbb007a9b73dbb8165891a3",
+  "forward_control_profile": {
+    "action_controls": [
+      {
+        "rudder": -0.1,
+        "throttle": 0.1
+      },
+      {
+        "rudder": -0.05,
+        "throttle": 0.1
+      },
+      {
+        "rudder": 0.0,
+        "throttle": 0.4
+      },
+      {
+        "rudder": 0.05,
+        "throttle": 0.1
+      },
+      {
+        "rudder": 0.1,
+        "throttle": 0.1
+      }
+    ],
+    "action_schema": "five-calibrated-controls-v3",
+    "calibration_hash": "4ab29d8494a09c5b68e77c6b65043b07d3366fa5df6220868a7dc959b343e684",
+    "cruise_throttle": 0.4,
+    "minimum_steerage_throttle": 0.1,
+    "negative_rudder_yaw_rate_gain": 2.293771896573827,
+    "positive_rudder_yaw_rate_gain": 2.1839170773221075,
+    "schema_version": "forward-control-profile-v2",
+    "speed_response": 0.8,
+    "throttle_speed_gain": 1.0996408856567297,
+    "yaw_response": 4.0
+  },
+  "gate_evidence": {
+    "completed_training_episodes": 70,
+    "offline_evaluation_passes": 0,
+    "offline_evaluations": 0,
+    "unity_adapt_episodes": 346,
+    "unity_validation_episodes": 0,
+    "unity_validation_passes": 0
+  },
+  "hidden_dim": 64,
+  "initialization": {
+    "inherited_checkpoint": null,
+    "seed": 20260805,
+    "type": "random"
+  },
+  "laser_emergency_distance_m": 0.0,
+  "map_payload_hash": "532c636f352ddd03ba50402032c45a8c0b885aff91b5f36fb2131946806829b7",
+  "observation_dim": 166,
+  "observation_schema": "local-waypoint-observation-v3",
+  "replay_schema": "national-test-replay-v3",
+  "required_clearance_m": 0.0,
+  "route_id": "aa74b6a21c9a4c53acccd4ba5e8abc57",
+  "schema_version": "national-test-sac-checkpoint-v6",
+  "stage": "UNITY_VALIDATION"
+}
