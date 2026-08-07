@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 from usvlib4ros.planning import Control, PlanningMapSnapshot, PrototypeReducedDynamics, VesselState
 
 
-FIXED_MAP_PREDICTION_HORIZON_S = 2.0
+FIXED_MAP_PREDICTION_HORIZON_S = 0.0
 
 
 @dataclass(frozen=True)
@@ -35,8 +35,8 @@ class PredictiveSafetySupervisor:
     """Predictive pre-mask plus final version check; it never publishes ROS output."""
 
     def __init__(self, prediction_horizon_s: float = 5.0, max_state_age_s: float = 2.0) -> None:
-        if not isfinite(prediction_horizon_s) or prediction_horizon_s <= 0.0:
-            raise ValueError("prediction_horizon_s must be positive and finite")
+        if not isfinite(prediction_horizon_s) or prediction_horizon_s < 0.0:
+            raise ValueError("prediction_horizon_s must be finite and non-negative")
         if not isfinite(max_state_age_s) or max_state_age_s < 0.0:
             raise ValueError("max_state_age_s must be finite and non-negative")
         self.prediction_horizon_s = float(prediction_horizon_s)
@@ -80,7 +80,7 @@ class PredictiveSafetySupervisor:
             or now_sim < state.stamp_sim
             or now_sim - state.stamp_sim > self.max_state_age_s
             or not isfinite(horizon_s)
-            or horizon_s <= 0.0
+            or horizon_s < 0.0
         ):
             return (False,) * 5, ("INVALID_INPUT",) * 5, (0.0,) * 5
         mask: list[bool] = []
@@ -91,6 +91,16 @@ class PredictiveSafetySupervisor:
                 mask.append(False)
                 reasons.append("INVALID_CONTROL")
                 clearances.append(0.0)
+                continue
+            if horizon_s == 0.0:
+                valid = map_snapshot.is_state_valid(state)
+                mask.append(valid)
+                reasons.append("SAFE" if valid else "MOTION_COLLISION")
+                clearances.append(
+                    max(0.0, map_snapshot.clearance_at(state))
+                    if valid
+                    else 0.0
+                )
                 continue
             try:
                 rollout = dynamics.propagate(

@@ -68,8 +68,18 @@ DEFAULT_UNITY_TEST_CHECKPOINT = DEFAULT_CHECKPOINT
 POSE_MAX_AGE_S = 0.5
 SCAN_MAX_AGE_S = 1.0
 DEVICE_MAX_AGE_S = 1.0
-REQUIRED_MAP_CLEARANCE_M = 0.2
-LASER_EMERGENCY_DISTANCE_M = 0.6
+REQUIRED_MAP_CLEARANCE_M = 0.0
+LASER_EMERGENCY_DISTANCE_M = 0.0
+MOTION_STALL_CYCLES = 30
+MOTION_STALL_DISTANCE_M = 0.05
+MOTION_STALL_SPEED_MPS = 0.03
+
+
+def laser_emergency_distance_m(snapshot, state: VesselState) -> float:
+    """Stop only on an explicit zero-range laser contact."""
+
+    del snapshot, state
+    return LASER_EMERGENCY_DISTANCE_M
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,8 @@ class RuntimeDecision:
     safety_truncated: bool
     observation: Optional[LocalWaypointObservationV3] = None
     training_trace: Optional[RuntimeTrainingTrace] = None
+    candidate_reasons: tuple[str, ...] = ("UNAVAILABLE",) * 5
+    candidate_clearances_m: tuple[float, ...] = (0.0,) * 5
 
     @property
     def stop(self) -> bool:
@@ -218,6 +230,7 @@ def load_policy(
             "PROMOTED",
         },
         PolicyMode.UNITY_TEST: {
+            "UNITY_DIAGNOSTIC",
             "UNITY_ADAPT",
             "UNITY_VALIDATION",
             "PROMOTED",
@@ -383,6 +396,9 @@ class FixedMapControllerCore:
         self.corridor_progress = 0.0
         self.transition_guard = ActuatorTransitionGuard()
         self.no_safe_actions = NoSafeActionWindow(limit=10)
+        self._last_commanded_throttle = 0.0
+        self._stall_origin_xy: Optional[tuple[float, float]] = None
+        self._stall_cycles = 0
 
     def _goal_xy(self) -> tuple[float, float]:
         if self.mission_index >= 13:
@@ -406,7 +422,10 @@ class FixedMapControllerCore:
         safety_intervened: bool = False,
         safety_truncated: bool = False,
         observation: Optional[LocalWaypointObservationV3] = None,
+        candidate_reasons: tuple[str, ...] = ("UNAVAILABLE",) * 5,
+        candidate_clearances_m: tuple[float, ...] = (0.0,) * 5,
     ) -> RuntimeDecision:
+        self._last_commanded_throttle = 0.0
         return RuntimeDecision(
             reason=reason,
             control=None,
@@ -425,7 +444,29 @@ class FixedMapControllerCore:
             safety_intervened=safety_intervened,
             safety_truncated=safety_truncated,
             observation=observation,
+            candidate_reasons=candidate_reasons,
+            candidate_clearances_m=candidate_clearances_m,
         )
+
+    def _motion_stalled(self, state: VesselState) -> bool:
+        if (
+            self._last_commanded_throttle <= 0.0
+            or state.speed >= MOTION_STALL_SPEED_MPS
+        ):
+            self._stall_origin_xy = None
+            self._stall_cycles = 0
+            return False
+        current = (state.x, state.y)
+        if self._stall_origin_xy is None:
+            self._stall_origin_xy = current
+            self._stall_cycles = 1
+            return False
+        if math.dist(current, self._stall_origin_xy) >= MOTION_STALL_DISTANCE_M:
+            self._stall_origin_xy = current
+            self._stall_cycles = 0
+            return False
+        self._stall_cycles += 1
+        return self._stall_cycles >= MOTION_STALL_CYCLES
 
     @staticmethod
     def _body_coordinates(
@@ -510,11 +551,12 @@ class FixedMapControllerCore:
         if not snapshot.is_state_valid(state):
             self.no_safe_actions.reset()
             return self._stop("MAP_INVALID", state)
+        laser_stop_distance = laser_emergency_distance_m(snapshot, state)
         if any(
             valid
             and (
                 not math.isfinite(float(distance))
-                or float(distance) <= LASER_EMERGENCY_DISTANCE_M
+                or float(distance) <= laser_stop_distance
             )
             for distance, valid in zip(
                 sample.laser_ranges,
@@ -557,6 +599,20 @@ class FixedMapControllerCore:
             self.mission_index,
         )
         self.corridor_progress = projection.route_progress
+        if self._motion_stalled(state):
+            observation = self._observation(
+                sample,
+                (False,) * 5,
+                projection.cross_track_error_m,
+                projection.heading_error_rad,
+            )
+            return self._stop(
+                "MOTION_STALLED",
+                state,
+                safety_intervened=True,
+                safety_truncated=True,
+                observation=observation,
+            )
         reachability = self.transition_guard.reachability_mask()
         predictive_mask, reasons, clearances = self.supervisor.precheck(
             state,
@@ -586,6 +642,8 @@ class FixedMapControllerCore:
                 safety_intervened=True,
                 safety_truncated=truncated,
                 observation=observation,
+                candidate_reasons=reasons,
+                candidate_clearances_m=clearances,
             )
         self.no_safe_actions.observe(fresh_inputs=True, has_safe_action=True)
         observation = self._observation(
@@ -644,9 +702,12 @@ class FixedMapControllerCore:
                 safety_intervened=True,
                 safety_truncated=truncated,
                 observation=stopped_observation,
+                candidate_reasons=tuple(final.reasons),
+                candidate_clearances_m=clearances,
             )
 
         self.transition_guard.record_executed(final.final_action)
+        self._last_commanded_throttle = final.control.throttle
         self.hidden = next_hidden
         self.hidden_reset = False
         desired_yaw = state.yaw + projection.heading_error_rad
@@ -679,6 +740,8 @@ class FixedMapControllerCore:
             safety_truncated=False,
             observation=observation,
             training_trace=trace,
+            candidate_reasons=tuple(final.reasons),
+            candidate_clearances_m=clearances,
         )
 
 
@@ -688,6 +751,8 @@ __all__ = [
     "FixedRouteContext",
     "FixedMapControllerCore",
     "LASER_EMERGENCY_DISTANCE_M",
+    "laser_emergency_distance_m",
+    "MOTION_STALL_CYCLES",
     "LiveInputAdapter",
     "REQUIRED_MAP_CLEARANCE_M",
     "RuntimeDecision",

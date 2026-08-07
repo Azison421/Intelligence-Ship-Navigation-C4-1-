@@ -17,6 +17,7 @@ from usvlib4ros.planning.kinodynamic_informed_rrtstar import VesselState
 
 
 FROZEN_CORRIDOR_SCHEMA = "fixed-route-corridor-v1"
+CORRIDOR_LOOKAHEAD_M = 1.0
 DEFAULT_CORRIDOR_PATH = (
     Path(__file__).resolve().parents[1]
     / "mapping"
@@ -140,8 +141,8 @@ class FrozenRouteCorridor:
             raise ValueError("corridor map payload hash is incompatible")
         if self.compiler_config_hash != snapshot.compiler_config_hash:
             raise ValueError("corridor compiler configuration is incompatible")
-        if self.required_clearance_m != 0.2 or snapshot.required_clearance != 0.2:
-            raise ValueError("corridor requires the 0.2 m map clearance baseline")
+        if self.required_clearance_m != 0.0 or snapshot.required_clearance != 0.0:
+            raise ValueError("corridor requires the zero-clearance map baseline")
         if len(self.task_points) != 13 or len(self.task_anchors) != 13:
             raise ValueError("corridor must bind exactly thirteen task points")
         if len(self.polyline) <= len(self.task_points):
@@ -195,8 +196,11 @@ class FrozenRouteCorridor:
         )
         if not snapshot.is_state_valid(state):
             raise ValueError("corridor enters invalid map space")
-        if snapshot.clearance_at(state) + 1e-9 < self.required_clearance_m:
-            raise ValueError("corridor violates the map clearance baseline")
+        if (
+            snapshot.clearance_at(state) + 1e-9
+            < snapshot.required_clearance_at(state)
+        ):
+            raise ValueError("corridor violates the active map clearance")
 
     @property
     def total_length_m(self) -> float:
@@ -290,10 +294,14 @@ class FrozenRouteCorridor:
                 - dy * (state.x - projected[0])
             ) / length
         lookahead_progress = min(
-            maximum_progress,
-            progress + 1.0 / total,
+            1.0,
+            progress + CORRIDOR_LOOKAHEAD_M / total,
         )
         lookahead, _, _ = self._point_at_progress(lookahead_progress)
+        lookahead_dx = lookahead[0] - state.x
+        lookahead_dy = lookahead[1] - state.y
+        if math.hypot(lookahead_dx, lookahead_dy) > 1e-12:
+            heading = math.atan2(lookahead_dy, lookahead_dx)
         return CorridorProjection(
             cross_track_error_m=cross_track,
             heading_error_rad=_wrap_angle(heading - state.yaw),

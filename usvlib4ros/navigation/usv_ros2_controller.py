@@ -86,6 +86,17 @@ class Ros2Controller:
         )
         return response["code"] == 1
 
+    def set_task(self):
+        """Request task start; DeviceStatus is the acknowledgement."""
+
+        return self.deviceControllerSrvCall.callService(
+            {
+                "client_id": "navigation",
+                "action": Constants.Request_Action.Set_Task,
+                "data": "1",
+            }
+        )
+
     def set_auto_work(self):
         response = self.deviceControllerSrvCall.callService(
             {

@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 
 import pytest
+import torch
 
 from usvlib4ros.policy.recurrent_sac import (
     LocalWaypointObservationV3,
@@ -91,6 +92,104 @@ def test_v3_episode_replay_updates_sac_without_crossing_boundaries():
     assert SequenceReplay.from_state_dict(replay.state_dict()).state_dict()[
         "schema_version"
     ] == "national-test-replay-v3"
+
+
+def test_replay_learns_from_known_zero_hidden_episode_boundary():
+    transition = SequenceTransition(
+        observation=_observation(0.0),
+        next_observation=_observation(0.1),
+        executed_action=4,
+        reward=1.0,
+        terminated=False,
+        truncated=True,
+        reason="TIME_LIMIT",
+    )
+    replay = SequenceReplay(capacity=1, seed=5)
+    replay.add_episode((transition,))
+
+    batch = replay.sample(batch_size=1, burn_in=2, unroll=1)
+
+    assert batch.hidden_reset[0, 0].item() is True
+    assert batch.learning_mask[0, 0].item() == 1.0
+
+
+def test_demonstration_warmup_increases_executed_action_probability():
+    transitions = tuple(
+        SequenceTransition(
+            observation=_observation(index * 0.1),
+            next_observation=_observation((index + 1) * 0.1),
+            executed_action=4,
+            reward=1.0,
+            terminated=False,
+            truncated=index == 11,
+            reason="TIME_LIMIT" if index == 11 else "STEP",
+        )
+        for index in range(12)
+    )
+    replay = SequenceReplay(capacity=4, seed=13)
+    replay.add_episode(transitions)
+    batch = replay.sample(batch_size=4, burn_in=2, unroll=4)
+    policy = RecurrentDiscreteSAC(hidden_dim=16, seed=13)
+    initial_alpha = float(policy.alpha.detach().item())
+    before, _ = policy.act(
+        _observation(0.0),
+        (True,) * 5,
+        deterministic=True,
+    )
+
+    for _ in range(20):
+        result = policy.update(batch, demonstration=True)
+
+    after, _ = policy.act(
+        _observation(0.0),
+        (True,) * 5,
+        deterministic=True,
+    )
+    assert result["actor_objective"] == "BEHAVIOR_CLONING"
+    assert result["behavior_clone_loss"] > 0.0
+    assert result["alpha"] == pytest.approx(initial_alpha)
+    assert after.masked_probabilities[4] > before.masked_probabilities[4]
+
+
+def test_dagger_expert_action_trains_actor_without_temperature_drift():
+    transitions = tuple(
+        SequenceTransition(
+            observation=_observation(index * 0.1),
+            next_observation=_observation((index + 1) * 0.1),
+            executed_action=4,
+            reward=1.0,
+            terminated=False,
+            truncated=index == 11,
+            reason="TIME_LIMIT" if index == 11 else "STEP",
+        )
+        for index in range(12)
+    )
+    replay = SequenceReplay(capacity=4, seed=23)
+    replay.add_episode(transitions)
+    batch = replay.sample(batch_size=4, burn_in=2, unroll=4)
+    policy = RecurrentDiscreteSAC(hidden_dim=16, seed=23)
+    expert_actions = torch.zeros_like(batch.actions)
+    initial_alpha = float(policy.alpha.detach().item())
+    before, _ = policy.act(
+        _observation(0.0),
+        (True,) * 5,
+        deterministic=True,
+    )
+
+    for _ in range(20):
+        result = policy.update(batch, expert_actions=expert_actions)
+
+    after, _ = policy.act(
+        _observation(0.0),
+        (True,) * 5,
+        deterministic=True,
+    )
+    assert result["actor_objective"] == "SAC_WITH_DAGGER"
+    assert result["alpha"] == pytest.approx(initial_alpha)
+    assert policy.actor_optimizer.param_groups[0]["lr"] == pytest.approx(
+        policy.actor_optimizer.defaults["lr"]
+    )
+    assert after.masked_probabilities[0] > before.masked_probabilities[0]
 
 
 def test_v6_policy_checkpoint_round_trip_is_non_overwriting(tmp_path: Path):

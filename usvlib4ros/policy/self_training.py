@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from hashlib import sha256
+from io import BytesIO
 import json
 from pathlib import Path
+from random import Random
 import time
 from typing import Callable, Mapping, Optional
 
@@ -31,6 +33,8 @@ from usvlib4ros.planning.forward_control_profile import (
 from .fixed_map_trainer import (
     EpisodeSummary,
     FixedMapSACTrainer,
+    OfflineEpisode,
+    TrainingDiagnostics,
     control_transition_reward,
 )
 from .recurrent_sac import (
@@ -43,8 +47,8 @@ from .recurrent_sac import (
 )
 
 
-STATE_SCHEMA = "national-test-self-training-state-v2"
-ACTIVE_SCHEMA = "national-test-active-checkpoint-v2"
+STATE_SCHEMA = "national-test-self-training-state-v6"
+ACTIVE_SCHEMA = "national-test-active-checkpoint-v3"
 CHECKPOINT_SCHEMA = "national-test-sac-checkpoint-v6"
 CALIBRATION_SCHEMA = "national-test-forward-calibration-v2"
 OFFLINE_BLOCK_EPISODES = 100
@@ -57,6 +61,7 @@ MAX_TRAINING_EPISODES = 1_000
 class SelfTrainingStage(str, Enum):
     OFFLINE_TRAIN = "OFFLINE_TRAIN"
     OFFLINE_EVAL = "OFFLINE_EVAL"
+    UNITY_DIAGNOSTIC = "UNITY_DIAGNOSTIC"
     UNITY_ADAPT = "UNITY_ADAPT"
     UNITY_VALIDATION = "UNITY_VALIDATION"
     PROMOTED = "PROMOTED"
@@ -105,7 +110,10 @@ class TrainingCursor:
             raise ValueError("offline block progress is invalid")
         if not 0 <= self.offline_evaluation_passes <= self.offline_evaluations <= 20:
             raise ValueError("offline evaluation counters are invalid")
-        if self.unity_adapt_episodes > 5 or self.unity_validation_episodes > 5:
+        if (
+            self.unity_adapt_episodes > MAX_TRAINING_EPISODES
+            or self.unity_validation_episodes > UNITY_VALIDATION_EPISODES
+        ):
             raise ValueError("Unity episode counters are invalid")
         if self.unity_validation_passes > self.unity_validation_episodes:
             raise ValueError("Unity validation counters are invalid")
@@ -148,12 +156,15 @@ class TrainingCursor:
 class TrainingSnapshot:
     cursor: TrainingCursor
     profile: ForwardControlProfile
+    map_payload_hash: str
+    corridor_hash: str
     training_state: dict[str, object]
     replay: SequenceReplay
+    trainer_rng_state: object
 
 
 class TrainingStateStore:
-    """Persist only the current V2 cursor, V3 replay, and V2 SAC state."""
+    """Persist the current cursor, replay, SAC state, and training RNG."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -169,47 +180,76 @@ class TrainingStateStore:
             "profile": forward_control_profile_to_dict(
                 trainer.forward_profile
             ),
+            "map_payload_hash": (
+                trainer._context.compiled_map.snapshot.payload_content_hash
+            ),
+            "corridor_hash": trainer._context.corridor.corridor_hash,
             "training_state": trainer.sac.training_state_dict(),
             "replay_state": trainer.replay.state_dict(),
+            "trainer_rng_state": trainer.rng.getstate(),
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         torch.save(payload, temporary)
-        for attempt in range(20):
+        for attempt in range(240):
             try:
                 temporary.replace(self.path)
                 break
             except PermissionError:
-                if attempt == 19:
+                if attempt == 239:
                     raise
-                time.sleep(0.05)
+                time.sleep(0.25)
         return self.path
 
     def load(self) -> TrainingSnapshot:
         if not self.path.is_file():
             raise FileNotFoundError(self.path)
         try:
-            payload = torch.load(self.path, map_location="cpu", weights_only=True)
+            payload = torch.load(
+                BytesIO(self.path.read_bytes()),
+                map_location="cpu",
+                weights_only=True,
+            )
         except Exception as exc:
             raise ValueError("training state cannot be safely loaded") from exc
         required = {
             "schema_version",
             "cursor",
             "profile",
+            "map_payload_hash",
+            "corridor_hash",
             "training_state",
             "replay_state",
+            "trainer_rng_state",
         }
         if not isinstance(payload, Mapping) or set(payload) != required:
             raise ValueError("training state schema is incompatible")
         if payload.get("schema_version") != STATE_SCHEMA:
-            raise ValueError("only national-test-self-training-state-v2 is supported")
+            raise ValueError("only national-test-self-training-state-v6 is supported")
+        map_payload_hash = payload["map_payload_hash"]
+        corridor_hash = payload["corridor_hash"]
+        if any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in (map_payload_hash, corridor_hash)
+        ):
+            raise ValueError("training state map identity is invalid")
         profile = forward_control_profile_from_dict(payload["profile"])
         replay = SequenceReplay.from_state_dict(payload["replay_state"])
+        trainer_rng_state = payload["trainer_rng_state"]
+        try:
+            Random().setstate(trainer_rng_state)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trainer random state is invalid") from exc
         return TrainingSnapshot(
             cursor=TrainingCursor.from_payload(payload["cursor"]),
             profile=profile,
+            map_payload_hash=map_payload_hash,
+            corridor_hash=corridor_hash,
             training_state=dict(payload["training_state"]),
             replay=replay,
+            trainer_rng_state=trainer_rng_state,
         )
 
     def restore_trainer(self) -> tuple[TrainingCursor, FixedMapSACTrainer]:
@@ -218,8 +258,15 @@ class TrainingStateStore:
             snapshot.profile,
             seed=snapshot.cursor.seed,
         )
+        if (
+            snapshot.map_payload_hash
+            != trainer._context.compiled_map.snapshot.payload_content_hash
+            or snapshot.corridor_hash != trainer._context.corridor.corridor_hash
+        ):
+            raise ValueError("training state map or corridor is incompatible")
         trainer.sac.load_training_state_dict(snapshot.training_state)
         trainer.replay = snapshot.replay
+        trainer.rng.setstate(snapshot.trainer_rng_state)
         trainer.completed_training_episodes = (
             snapshot.cursor.completed_training_episodes
         )
@@ -254,19 +301,22 @@ class ActiveCheckpointRegistry:
             "checkpoint_sha256"
         ):
             raise ValueError("active checkpoint hash is invalid")
+        validate_checkpoint_manifest(checkpoint, expected_stage=stage)
         return checkpoint
 
     def write(self, checkpoint: Path, stage: SelfTrainingStage) -> Path:
         checkpoint = Path(checkpoint)
+        stage = SelfTrainingStage(stage)
         if checkpoint.parent.resolve() != self.path.parent.resolve():
             raise ValueError("active checkpoint must share the registry directory")
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
+        validate_checkpoint_manifest(checkpoint, expected_stage=stage)
         payload = {
             "schema_version": ACTIVE_SCHEMA,
             "checkpoint": checkpoint.name,
             "checkpoint_sha256": _digest(checkpoint),
-            "stage": SelfTrainingStage(stage).value,
+            "stage": stage.value,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -280,6 +330,122 @@ class ActiveCheckpointRegistry:
 
 def _digest(path: Path) -> str:
     return sha256(Path(path).read_bytes()).hexdigest()
+
+
+def validate_checkpoint_manifest(
+    checkpoint: Path,
+    *,
+    expected_stage: Optional[SelfTrainingStage] = None,
+) -> dict[str, object]:
+    checkpoint = Path(checkpoint)
+    manifest_path = checkpoint.with_suffix(checkpoint.suffix + ".json")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != CHECKPOINT_SCHEMA
+        or manifest.get("checkpoint_sha256") != _digest(checkpoint)
+    ):
+        raise ValueError("checkpoint manifest is incompatible")
+    try:
+        stage = SelfTrainingStage(manifest["stage"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("checkpoint stage is invalid") from exc
+    if expected_stage is not None and stage is not SelfTrainingStage(expected_stage):
+        raise ValueError("active registry and checkpoint stage differ")
+
+    evidence = manifest.get("gate_evidence")
+    required = {
+        "completed_training_episodes",
+        "offline_evaluations",
+        "offline_evaluation_passes",
+        "unity_adapt_episodes",
+        "unity_validation_episodes",
+        "unity_validation_passes",
+    }
+    if (
+        not isinstance(evidence, Mapping)
+        or set(evidence) != required
+        or any(
+            isinstance(evidence[name], bool)
+            or not isinstance(evidence[name], int)
+            or evidence[name] < 0
+            for name in required
+        )
+    ):
+        raise ValueError("checkpoint gate evidence is invalid")
+    if (
+        evidence["completed_training_episodes"] > MAX_TRAINING_EPISODES
+        or not (
+            0
+            <= evidence["offline_evaluation_passes"]
+            <= evidence["offline_evaluations"]
+            <= OFFLINE_EVALUATION_EPISODES
+        )
+        or evidence["unity_adapt_episodes"] > MAX_TRAINING_EPISODES
+        or not (
+            0
+            <= evidence["unity_validation_passes"]
+            <= evidence["unity_validation_episodes"]
+            <= UNITY_VALIDATION_EPISODES
+        )
+    ):
+        raise ValueError("checkpoint gate evidence is invalid")
+
+    offline_passed = (
+        evidence["offline_evaluations"] == OFFLINE_EVALUATION_EPISODES
+        and evidence["offline_evaluation_passes"] == OFFLINE_EVALUATION_EPISODES
+    )
+    training_gate_complete = (
+        OFFLINE_BLOCK_EPISODES
+        <= evidence["completed_training_episodes"]
+        <= MAX_TRAINING_EPISODES
+        and evidence["completed_training_episodes"] % OFFLINE_BLOCK_EPISODES == 0
+    )
+    direct_unity_entry = (
+        evidence["completed_training_episodes"] > 0
+        and evidence["offline_evaluations"] == 0
+        and evidence["offline_evaluation_passes"] == 0
+    )
+    if stage in {
+        SelfTrainingStage.UNITY_ADAPT,
+        SelfTrainingStage.UNITY_VALIDATION,
+        SelfTrainingStage.PROMOTED,
+    } and not (
+        direct_unity_entry
+        or (training_gate_complete and offline_passed)
+    ):
+        raise ValueError("promotion gate evidence is incomplete")
+    if stage is SelfTrainingStage.UNITY_DIAGNOSTIC and (
+        evidence["completed_training_episodes"] <= 0
+        or evidence["offline_evaluations"] != 0
+        or evidence["offline_evaluation_passes"] != 0
+        or evidence["unity_adapt_episodes"] != 0
+        or evidence["unity_validation_episodes"] != 0
+        or evidence["unity_validation_passes"] != 0
+    ):
+        raise ValueError("diagnostic checkpoint evidence is invalid")
+    if stage is SelfTrainingStage.UNITY_ADAPT and (
+        evidence["unity_validation_episodes"] != 0
+        or evidence["unity_validation_passes"] != 0
+    ):
+        raise ValueError("promotion gate evidence is incomplete")
+    if stage in {
+        SelfTrainingStage.UNITY_VALIDATION,
+        SelfTrainingStage.PROMOTED,
+    } and evidence["unity_adapt_episodes"] < UNITY_ADAPT_EPISODES:
+        raise ValueError("promotion gate evidence is incomplete")
+    if stage is SelfTrainingStage.UNITY_VALIDATION and (
+        evidence["unity_validation_episodes"] >= UNITY_VALIDATION_EPISODES
+    ):
+        raise ValueError("promotion gate evidence is incomplete")
+    if stage is SelfTrainingStage.PROMOTED and (
+        evidence["unity_validation_episodes"] != UNITY_VALIDATION_EPISODES
+        or evidence["unity_validation_passes"] != UNITY_VALIDATION_EPISODES
+    ):
+        raise ValueError("promotion gate evidence is incomplete")
+    return manifest
 
 
 def load_calibration(path: Path) -> ForwardControlProfile:
@@ -352,7 +518,8 @@ def save_stage_checkpoint(
     else:
         name = (
             f"national_test_sac_v6_seed{cursor.seed}_"
-            f"g{cursor.generation}_{cursor.stage.value.lower()}_"
+            f"g{cursor.generation}_t{cursor.completed_training_episodes}_"
+            f"{cursor.stage.value.lower()}_"
             f"a{cursor.unity_adapt_episodes}_"
             f"v{cursor.unity_validation_episodes}.pt"
         )
@@ -409,12 +576,32 @@ class OfflineTrainingGate:
         seed: int,
         state_store: TrainingStateStore,
         checkpoint_dir: Path,
-        progress: Optional[Callable[[TrainingCursor, EpisodeSummary], None]] = None,
+        stop_after_training_episodes: Optional[int] = None,
+        progress: Optional[
+            Callable[
+                [TrainingCursor, EpisodeSummary, Optional[TrainingDiagnostics]],
+                None,
+            ]
+        ] = None,
     ) -> None:
         self.profile = profile
         self.seed = seed
         self.state_store = state_store
         self.checkpoint_dir = Path(checkpoint_dir)
+        if (
+            isinstance(stop_after_training_episodes, bool)
+            or (
+                stop_after_training_episodes is not None
+                and (
+                    not isinstance(stop_after_training_episodes, int)
+                    or not 1
+                    <= stop_after_training_episodes
+                    <= MAX_TRAINING_EPISODES
+                )
+            )
+        ):
+            raise ValueError("training stop must be between 1 and 1000")
+        self.stop_after_training_episodes = stop_after_training_episodes
         self.progress = progress
 
     def _load_or_create(self) -> tuple[TrainingCursor, FixedMapSACTrainer]:
@@ -434,14 +621,20 @@ class OfflineTrainingGate:
         self,
         cursor: TrainingCursor,
         trainer: FixedMapSACTrainer,
-        summary: EpisodeSummary,
+        result: OfflineEpisode,
     ) -> None:
         self.state_store.save(cursor, trainer)
         if self.progress is not None:
-            self.progress(cursor, summary)
+            self.progress(cursor, result.summary, result.training)
 
     def run(self) -> tuple[TrainingCursor, FixedMapSACTrainer]:
         cursor, trainer = self._load_or_create()
+        if (
+            self.stop_after_training_episodes is not None
+            and cursor.completed_training_episodes
+            >= self.stop_after_training_episodes
+        ):
+            return cursor, trainer
         if cursor.stage not in {
             SelfTrainingStage.OFFLINE_TRAIN,
             SelfTrainingStage.OFFLINE_EVAL,
@@ -451,18 +644,28 @@ class OfflineTrainingGate:
             if cursor.stage is SelfTrainingStage.OFFLINE_TRAIN:
                 while cursor.offline_block_progress < OFFLINE_BLOCK_EPISODES:
                     episode_id = cursor.completed_training_episodes + 1
+                    dagger_rollout = (
+                        episode_id > OFFLINE_BLOCK_EPISODES
+                        and episode_id % 2 == 1
+                    )
                     result = trainer.run_episode(
                         episode=episode_id,
                         training=True,
-                        deterministic=False,
-                        full_route=(episode_id % 4 == 0),
+                        deterministic=dagger_rollout,
+                        full_route=dagger_rollout or episode_id % 4 == 0,
                     )
                     cursor = replace(
                         cursor,
                         completed_training_episodes=episode_id,
                         offline_block_progress=cursor.offline_block_progress + 1,
                     )
-                    self._save(cursor, trainer, result.summary)
+                    self._save(cursor, trainer, result)
+                    if (
+                        self.stop_after_training_episodes is not None
+                        and cursor.completed_training_episodes
+                        >= self.stop_after_training_episodes
+                    ):
+                        return cursor, trainer
                     if cursor.completed_training_episodes >= MAX_TRAINING_EPISODES:
                         break
                 if cursor.offline_block_progress < OFFLINE_BLOCK_EPISODES:
@@ -478,6 +681,8 @@ class OfflineTrainingGate:
             while (
                 cursor.stage is SelfTrainingStage.OFFLINE_EVAL
                 and cursor.offline_evaluations < OFFLINE_EVALUATION_EPISODES
+                and cursor.offline_evaluation_passes
+                == cursor.offline_evaluations
             ):
                 evaluation_id = (
                     cursor.completed_training_episodes * 100
@@ -500,7 +705,7 @@ class OfflineTrainingGate:
                         cursor.offline_evaluation_passes + int(passed)
                     ),
                 )
-                self._save(cursor, trainer, result.summary)
+                self._save(cursor, trainer, result)
 
             if (
                 cursor.offline_evaluations == OFFLINE_EVALUATION_EPISODES
@@ -529,16 +734,14 @@ class OfflineTrainingGate:
             )
             self.state_store.save(cursor, trainer)
 
-        cursor = replace(cursor, stage=SelfTrainingStage.TRAINING_GATE_FAILED)
-        self.state_store.save(cursor, trainer)
-        registry = ActiveCheckpointRegistry(
-            self.checkpoint_dir / "national_test_sac_active.json"
+        cursor = replace(
+            cursor,
+            stage=SelfTrainingStage.TRAINING_GATE_FAILED,
+            active_checkpoint=None,
         )
-        if cursor.active_checkpoint is not None:
-            checkpoint = self.checkpoint_dir / cursor.active_checkpoint
-            if checkpoint.is_file():
-                registry.write(checkpoint, cursor.stage)
-                update_checkpoint_stage(checkpoint, cursor)
+        self.state_store.save(cursor, trainer)
+        registry_path = self.checkpoint_dir / "national_test_sac_active.json"
+        registry_path.unlink(missing_ok=True)
         return cursor, trainer
 
 
@@ -652,18 +855,19 @@ class UnityTransitionRecorder:
 def train_from_unity_episode(
     trainer: FixedMapSACTrainer,
     transitions: tuple[SequenceTransition, ...],
-) -> None:
+) -> Optional[TrainingDiagnostics]:
     if not transitions:
-        return
-    trainer.replay.add_episode(transitions)
-    updates = min(64, max(1, len(transitions) // 8))
-    for _ in range(updates):
-        batch = trainer.replay.sample(batch_size=8, burn_in=8, unroll=16)
-        trainer.sac.update(batch)
+        return None
+    return trainer.learn_from_episode(
+        transitions,
+        maximum_updates=64,
+        transitions_per_update=2,
+        demonstration=False,
+    )
 
 
 class UnityTrainingGate:
-    """Advance exactly five adaptation and five frozen validation episodes."""
+    """Adapt until a route pass, then run five frozen validation episodes."""
 
     def __init__(
         self,
@@ -676,6 +880,7 @@ class UnityTrainingGate:
         self.registry = ActiveCheckpointRegistry(
             self.checkpoint_dir / "national_test_sac_active.json"
         )
+        self.last_training_diagnostics: Optional[TrainingDiagnostics] = None
         self.cursor, self.trainer = state_store.restore_trainer()
         if self.cursor.stage not in {
             SelfTrainingStage.UNITY_ADAPT,
@@ -714,6 +919,7 @@ class UnityTrainingGate:
         if type(operator_truncated) is not bool:
             raise ValueError("operator_truncated must be boolean")
         if not counted:
+            self.last_training_diagnostics = None
             if transitions:
                 self.trainer.replay.add_episode(transitions)
             self.cursor = replace(
@@ -727,20 +933,24 @@ class UnityTrainingGate:
             return self.cursor
 
         if self.cursor.stage is SelfTrainingStage.UNITY_ADAPT:
-            train_from_unity_episode(self.trainer, transitions)
+            self.last_training_diagnostics = train_from_unity_episode(
+                self.trainer,
+                transitions,
+            )
             adapt_episodes = self.cursor.unity_adapt_episodes + 1
             self.cursor = replace(
                 self.cursor,
                 unity_adapt_episodes=adapt_episodes,
                 stage=(
                     SelfTrainingStage.UNITY_VALIDATION
-                    if adapt_episodes == UNITY_ADAPT_EPISODES
+                    if adapt_episodes >= UNITY_ADAPT_EPISODES and passed
                     else SelfTrainingStage.UNITY_ADAPT
                 ),
             )
             self._save_new_active()
             return self.cursor
 
+        self.last_training_diagnostics = None
         if not passed and transitions:
             self.trainer.replay.add_episode(transitions)
         validation_episodes = self.cursor.unity_validation_episodes + 1
@@ -775,7 +985,7 @@ class UnityTrainingGate:
             stage=SelfTrainingStage.OFFLINE_TRAIN,
         )
         update_checkpoint_stage(failed_checkpoint, failed_cursor)
-        self.registry.write(failed_checkpoint, failed_cursor.stage)
+        self.registry.path.unlink(missing_ok=True)
         self.cursor = replace(
             failed_cursor,
             generation=failed_cursor.generation + 1,
@@ -811,4 +1021,5 @@ __all__ = [
     "save_stage_checkpoint",
     "train_from_unity_episode",
     "update_checkpoint_stage",
+    "validate_checkpoint_manifest",
 ]

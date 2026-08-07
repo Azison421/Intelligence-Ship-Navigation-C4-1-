@@ -27,7 +27,11 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from usvlib4ros.planning import CircularObstacle, PlanningMapSnapshot
+from usvlib4ros.planning import (
+    CircularObstacle,
+    LocalClearanceZone,
+    PlanningMapSnapshot,
+)
 
 from .coordinates import (
     AffineTransform2D,
@@ -38,11 +42,11 @@ from .coordinates import (
 )
 
 SIDECAR_SCHEMA_VERSION = "build-bound-static-world-sidecar-v1"
-COMPILER_VERSION = "beihu-sidecar-compiler-v3"
+COMPILER_VERSION = "beihu-sidecar-compiler-v4"
 DEFAULT_RESOLUTION_M = 0.2
 DEFAULT_MARGIN_M = 5.0
 DEFAULT_FOOTPRINT_RADIUS_M = 0.4
-DEFAULT_REQUIRED_CLEARANCE_M = 0.2
+DEFAULT_REQUIRED_CLEARANCE_M = 0.0
 COVERAGE_CANDIDATE = "candidate_complete_prior"
 COVERAGE_COMPLETE = "complete_prior"
 PROMOTION_NOTE_PREFIX = "operator-authorization:"
@@ -57,6 +61,7 @@ class SidecarCompilerConfig:
     margin_m: float = DEFAULT_MARGIN_M
     footprint_radius_m: float = DEFAULT_FOOTPRINT_RADIUS_M
     required_clearance_m: float = DEFAULT_REQUIRED_CLEARANCE_M
+    local_clearance_zones: tuple[LocalClearanceZone, ...] = ()
     geometry_version: str = "circle-v1"
     transform_model: str = "axis_affine"
     coverage_status: str = COVERAGE_CANDIDATE
@@ -71,6 +76,11 @@ class SidecarCompilerConfig:
             min(self.resolution_m, self.margin_m) > 0.0
             and self.footprint_radius_m >= 0.0
             and self.required_clearance_m >= 0.0
+            and all(
+                isinstance(zone, LocalClearanceZone)
+                and zone.required_clearance <= self.required_clearance_m
+                for zone in self.local_clearance_zones
+            )
             and isinstance(self.geometry_version, str)
             and bool(self.geometry_version)
             and self.transform_model in TRANSFORM_MODELS
@@ -87,6 +97,16 @@ class SidecarCompilerConfig:
                 f"{self.margin_m:.17g}",
                 f"{self.footprint_radius_m:.17g}",
                 f"{self.required_clearance_m:.17g}",
+                *(
+                    "clearance-zone="
+                    f"{zone.start_x:.17g},"
+                    f"{zone.start_y:.17g},"
+                    f"{zone.end_x:.17g},"
+                    f"{zone.end_y:.17g},"
+                    f"{zone.half_width:.17g},"
+                    f"{zone.required_clearance:.17g}"
+                    for zone in self.local_clearance_zones
+                ),
                 f"geometry={self.geometry_version}",
                 f"transform={self.transform_model}",
                 f"coverage={self.coverage_status}",
@@ -321,6 +341,7 @@ def compile_beihu_sidecar(
         stamp_sim=stamp_sim,
         source_artifact_hash=source_artifact_hash,
         compiler_config_hash=config.config_hash(),
+        local_clearance_zones=config.local_clearance_zones,
         circular_obstacles=tuple(
             CircularObstacle(
                 x=buoy.x - origin[0],

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import threading
@@ -27,6 +26,7 @@ from usvlib4ros.policy.self_training import (
     TrainingStateStore,
     UnityTrainingGate,
     UnityTransitionRecorder,
+    validate_checkpoint_manifest,
 )
 from usvlib4ros.usvRosUtil import LogUtil
 
@@ -35,8 +35,9 @@ CONTROL_PERIOD_S = 0.1
 MAX_EPISODE_SECONDS = 600.0
 TELEMETRY_DIR = Path(__file__).resolve().parents[2] / "artifacts" / "logs"
 TRAINING_STATE_PATH = (
-    DEFAULT_CHECKPOINT.parent / "national_test_self_training_v2.pt"
+    DEFAULT_CHECKPOINT.parent / "national_test_self_training_v6.pt"
 )
+UNITY_RESET_TIMEOUT_S = 30.0
 ENVIRONMENT_STOP_REASONS = frozenset(
     {
         "DEVICE_STALE",
@@ -51,6 +52,7 @@ POLICY_FAILURE_REASONS = frozenset(
         "DYNAMICS_INVALID",
         "LASER_EMERGENCY_STOP",
         "MAP_INVALID",
+        "MOTION_STALLED",
         "NO_SAFE_ACTION_TRUNCATED",
         "POLICY_NO_ACTION",
     }
@@ -72,12 +74,7 @@ def preflight_assets(checkpoint_path: Optional[Path] = None) -> None:
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError("required National_Test assets are missing: " + ", ".join(missing))
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != "national-test-sac-checkpoint-v6":
-        raise ValueError("only national-test-sac-checkpoint-v6 is supported")
-    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
-    if manifest.get("checkpoint_sha256") != digest:
-        raise ValueError("V6 checkpoint hash is invalid")
+    validate_checkpoint_manifest(checkpoint)
 
 
 class FixedMapNavigationService:
@@ -142,6 +139,73 @@ class FixedMapNavigationService:
         )
         return throttle, rudder
 
+    def _request_unity_reset(
+        self,
+        *,
+        timeout_s: float = UNITY_RESET_TIMEOUT_S,
+    ) -> bool:
+        initial_request_time = float(
+            getattr(
+                self.global_data.device_data,
+                "reset_request_time",
+                0.0,
+            )
+            or 0.0
+        )
+        self._publish_zero()
+        if not self.ros_ctrl.reset_unity():
+            return False
+        deadline = time.monotonic() + timeout_s
+        observed_request = False
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            device = self.global_data.device_data
+            reset_status = int(getattr(device, "reset_status", 0) or 0)
+            request_time = float(
+                getattr(device, "reset_request_time", 0.0) or 0.0
+            )
+            if reset_status == 1 or request_time != initial_request_time:
+                observed_request = True
+            if observed_request and reset_status == 2:
+                return True
+            self._publish_zero()
+            self._stop.wait(0.05)
+        return False
+
+    def _request_unity_episode_start(
+        self,
+        *,
+        timeout_s: float = UNITY_RESET_TIMEOUT_S,
+    ) -> bool:
+        self._publish_zero()
+        device = self.global_data.device_data
+        if int(getattr(device, "work_model", 0) or 0) != 2:
+            if not self.ros_ctrl.set_auto_work():
+                return False
+        deadline = time.monotonic() + timeout_s
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            device = self.global_data.device_data
+            if int(getattr(device, "work_model", 0) or 0) == 2:
+                break
+            self._publish_zero()
+            self._stop.wait(0.05)
+        else:
+            return False
+
+        if int(getattr(self.global_data.device_data, "task_status", 0) or 0) != 0:
+            return True
+
+        self.ros_ctrl.set_task()
+        while not self._stop.is_set() and time.monotonic() < deadline:
+            device = self.global_data.device_data
+            if (
+                int(getattr(device, "work_model", 0) or 0) == 2
+                and int(getattr(device, "task_status", 0) or 0) != 0
+            ):
+                return True
+            self._publish_zero()
+            self._stop.wait(0.05)
+        return False
+
     def _algorithm_status(self, *, episode: int, step: int, running: bool) -> None:
         self.global_data.updateAlgorithmOutput(
             episode,
@@ -205,9 +269,10 @@ class FixedMapNavigationService:
         decision: Optional[RuntimeDecision] = None,
         command: tuple[int, int] = (0, 0),
         detail: Optional[str] = None,
+        progress: Optional[dict[str, object]] = None,
     ) -> None:
         row: dict[str, object] = {
-            "schema_version": "national-test-runtime-telemetry-v1",
+            "schema_version": "national-test-runtime-telemetry-v2",
             "event": event,
             "wall_time_s": time.time(),
             "episode": episode,
@@ -221,6 +286,8 @@ class FixedMapNavigationService:
         }
         if detail is not None:
             row["detail"] = detail
+        if progress is not None:
+            row["progress"] = progress
         if decision is not None:
             row.update(
                 {
@@ -231,11 +298,31 @@ class FixedMapNavigationService:
                     "executed_action": decision.action,
                     "safe_action_mask": list(decision.safe_mask),
                     "reachability_mask": list(decision.reachability_mask),
+                    "candidate_reasons": list(decision.candidate_reasons),
+                    "candidate_clearances_m": list(
+                        decision.candidate_clearances_m
+                    ),
                     "safety_intervened": decision.safety_intervened,
                     "safety_truncated": decision.safety_truncated,
                     "completed": decision.completed,
                 }
             )
+            if decision.observation is not None:
+                observation = decision.observation
+                row["observation"] = {
+                    "speed_mps": observation.speed_mps,
+                    "yaw_rate_rad_s": observation.yaw_rate_rad_s,
+                    "actual_throttle": observation.actual_throttle,
+                    "actual_rudder": observation.actual_rudder,
+                    "corridor_cross_track_m": (
+                        observation.corridor_cross_track_m
+                    ),
+                    "corridor_heading_error_rad": (
+                        observation.corridor_heading_error_rad
+                    ),
+                    "corridor_progress": observation.corridor_progress,
+                    "map_clearance_m": observation.map_clearance_m,
+                }
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -273,6 +360,7 @@ class FixedMapNavigationService:
         recorder = UnityTransitionRecorder()
         episode_started = time.monotonic()
         step = 0
+        inactive_task_cycles = 0
         while not self._stop.is_set():
             cycle_started = time.perf_counter()
             if time.monotonic() - episode_started >= MAX_EPISODE_SECONDS:
@@ -284,11 +372,19 @@ class FixedMapNavigationService:
                 return "TIME_LIMIT", recorder.transitions
             sample = adapter.build()
             if sample.task_status == 0:
-                recorder.operator_stop(core.mission_index)
+                inactive_task_cycles += 1
                 self._publish_zero(
                     point_index=core.mission_index,
                     distance=core._distance(sample.vessel_state),
                 )
+                if inactive_task_cycles < 20:
+                    remaining = CONTROL_PERIOD_S - (
+                        time.perf_counter() - cycle_started
+                    )
+                    if remaining > 0.0:
+                        self._stop.wait(remaining)
+                    continue
+                recorder.operator_stop(core.mission_index)
                 self._record(
                     telemetry,
                     event="operator_truncated",
@@ -297,6 +393,7 @@ class FixedMapNavigationService:
                     cycle_ms=(time.perf_counter() - cycle_started) * 1000.0,
                 )
                 return "OPERATOR_TRUNCATED", recorder.transitions
+            inactive_task_cycles = 0
             try:
                 decision = core.step(sample)
             except Exception as exc:
@@ -395,7 +492,17 @@ class FixedMapNavigationService:
                     ),
                 )
                 stage_detail = outcome
+                reset_required = False
+                progress = None
                 if unity_gate is not None:
+                    episode_stage = unity_gate.cursor.stage
+                    adapt_episodes = unity_gate.cursor.unity_adapt_episodes
+                    validation_episodes = (
+                        unity_gate.cursor.unity_validation_episodes
+                    )
+                    validation_passes = (
+                        unity_gate.cursor.unity_validation_passes
+                    )
                     counted = outcome not in {
                         "CONTROLLER_EXCEPTION",
                         "CONTROL_DEADLINE_MISSED",
@@ -403,6 +510,14 @@ class FixedMapNavigationService:
                         "OPERATOR_TRUNCATED",
                         "SERVICE_STOPPED",
                     }
+                    if counted and episode_stage is SelfTrainingStage.UNITY_ADAPT:
+                        adapt_episodes += 1
+                    elif (
+                        counted
+                        and episode_stage is SelfTrainingStage.UNITY_VALIDATION
+                    ):
+                        validation_episodes += 1
+                        validation_passes += int(outcome == "MISSION_COMPLETE")
                     cursor = unity_gate.finish_episode(
                         transitions,
                         counted=counted,
@@ -411,27 +526,38 @@ class FixedMapNavigationService:
                             outcome == "OPERATOR_TRUNCATED"
                         ),
                     )
+                    reset_required = counted and (
+                        cursor.stage is not SelfTrainingStage.PROMOTED
+                    )
                     if cursor.active_checkpoint is not None:
                         self.checkpoint_path = (
                             DEFAULT_CHECKPOINT.parent
                             / cursor.active_checkpoint
                         )
-                    stage_detail = f"{outcome}:{cursor.stage.value}"
+                    stage_detail = f"{outcome}:{episode_stage.value}"
+                    progress = {
+                        "outcome": outcome,
+                        "stage": episode_stage.value,
+                        "next_stage": cursor.stage.value,
+                        "unity_adapt_episodes": adapt_episodes,
+                        "unity_validation_episodes": validation_episodes,
+                        "unity_validation_passes": validation_passes,
+                    }
+                    diagnostics = unity_gate.last_training_diagnostics
+                    if diagnostics is not None:
+                        progress["training"] = {
+                            "attempted_updates": (
+                                diagnostics.attempted_updates
+                            ),
+                            "applied_updates": diagnostics.applied_updates,
+                            "critic_loss": diagnostics.critic_loss,
+                            "actor_loss": diagnostics.actor_loss,
+                            "alpha": diagnostics.alpha,
+                            "entropy": diagnostics.entropy,
+                        }
                     print(
                         json.dumps(
-                            {
-                                "outcome": outcome,
-                                "stage": cursor.stage.value,
-                                "unity_adapt_episodes": (
-                                    cursor.unity_adapt_episodes
-                                ),
-                                "unity_validation_episodes": (
-                                    cursor.unity_validation_episodes
-                                ),
-                                "unity_validation_passes": (
-                                    cursor.unity_validation_passes
-                                ),
-                            },
+                            progress,
                             ensure_ascii=False,
                             sort_keys=True,
                         ),
@@ -444,9 +570,44 @@ class FixedMapNavigationService:
                     step=0,
                     cycle_ms=0.0,
                     detail=stage_detail,
+                    progress=progress,
                 )
                 self._publish_zero()
-                if self.single_episode:
+                episode_ready = False
+                if reset_required and int(
+                    getattr(self.global_data.device_data, "task_status", 0) or 0
+                ) == 0:
+                    reset_required = False
+                if reset_required:
+                    reset_ok = self._request_unity_reset()
+                    self._record(
+                        telemetry,
+                        event=(
+                            "unity_reset_complete"
+                            if reset_ok
+                            else "unity_reset_failed"
+                        ),
+                        episode=episode,
+                        step=0,
+                        cycle_ms=0.0,
+                    )
+                    if not reset_ok:
+                        return
+                    episode_ready = self._request_unity_episode_start()
+                    self._record(
+                        telemetry,
+                        event=(
+                            "unity_episode_ready"
+                            if episode_ready
+                            else "unity_retrigger_failed"
+                        ),
+                        episode=episode,
+                        step=0,
+                        cycle_ms=0.0,
+                    )
+                    if not episode_ready:
+                        return
+                if self.single_episode and not episode_ready:
                     while not self._stop.is_set() and int(
                         getattr(self.global_data.device_data, "task_status", 0) or 0
                     ) != 0:

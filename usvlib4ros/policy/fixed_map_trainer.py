@@ -8,24 +8,27 @@ from random import Random
 from typing import Optional
 
 import numpy as np
+import torch
 
 from usvlib4ros.navigation.fixed_map_runtime import (
     FixedMapControllerCore,
-    LASER_EMERGENCY_DISTANCE_M,
     RuntimeDecision,
     RuntimeInput,
     RuntimeTrainingTrace,
     build_fixed_route_context,
+    laser_emergency_distance_m,
 )
 from usvlib4ros.planning import Control, PrototypeReducedDynamics, VesselState
 from usvlib4ros.planning.forward_control_profile import (
     ForwardControlProfile,
     reduced_dynamics_from_profile,
 )
+from usvlib4ros.planning.fixed_route import fixed_route_waypoint_reached
 
 from .recurrent_sac import (
     LocalWaypointObservationV3,
     RecurrentDiscreteSAC,
+    ReplaySequenceBatch,
     SequenceReplay,
     SequenceTransition,
 )
@@ -37,14 +40,16 @@ from .safety_supervisor import (
 
 
 CONTROL_PERIOD_S = 0.1
-DEFAULT_MAX_STEPS = 2_500
+DEFAULT_MAX_STEPS = 6_000
 LASER_MAX_RANGE_M = 20.0
 LASER_RAYCAST_RANGE_M = 10.0
+GUIDED_REPLAY_EPISODES = 100
 TERMINAL_REASONS = frozenset(
     {
         "DYNAMICS_INVALID",
         "MAP_INVALID",
         "LASER_EMERGENCY_STOP",
+        "MOTION_STALLED",
         "NO_SAFE_ACTION_TRUNCATED",
         "POLICY_NO_ACTION",
         "CONTROLLER_EXCEPTION",
@@ -66,23 +71,49 @@ def control_transition_reward(
 ) -> float:
     """Reward actual control/progress, never the integer action label."""
 
+    current_distance = math.hypot(*observation.current_waypoint_body_xy)
+    next_distance = math.hypot(*next_observation.current_waypoint_body_xy)
+    waypoint_progress = (
+        0.0
+        if mission_delta > 0
+        else max(-1.0, min(1.0, current_distance - next_distance))
+    )
     corridor_delta = (
         next_observation.corridor_progress - observation.corridor_progress
     )
-    reward = 40.0 * corridor_delta + 8.0 * max(0, mission_delta)
+    heading_improvement = (
+        abs(observation.corridor_heading_error_rad)
+        - abs(next_observation.corridor_heading_error_rad)
+    )
+    cross_track_improvement = (
+        abs(observation.corridor_cross_track_m)
+        - abs(next_observation.corridor_cross_track_m)
+    )
+    current_safe = sum(observation.safe_action_mask)
+    next_safe = sum(next_observation.safe_action_mask)
+    reward = 4.0 * waypoint_progress
+    reward += 20.0 * corridor_delta
+    reward += 25.0 * max(0, mission_delta)
+    reward += 5.0 * heading_improvement
+    reward += 2.0 * cross_track_improvement
+    reward += 0.1 * (next_safe - current_safe)
+    reward -= 0.08 * abs(next_observation.corridor_heading_error_rad)
+    reward -= 0.2 * abs(next_observation.corridor_cross_track_m)
+    reward -= (
+        0.5
+        * next_observation.speed_mps
+        * max(0.0, min(1.0, (3.0 - next_distance) / 3.0))
+    )
     reward -= 0.03 * abs(control.throttle)
     reward -= 0.05 * abs(control.rudder)
     reward -= 0.08 * abs(control.throttle - previous_control.throttle)
     reward -= 0.12 * abs(control.rudder - previous_control.rudder)
-    reward -= 0.1 * abs(next_observation.corridor_cross_track_m)
-    if next_observation.map_clearance_m < 0.6:
-        reward -= 0.5 * (0.6 - next_observation.map_clearance_m)
     if completed:
-        reward += 250.0
+        reward += 100.0
     elif terminated:
-        reward -= 150.0 if reason == "NO_SAFE_ACTION_TRUNCATED" else 250.0
+        reward -= 50.0 if reason == "NO_SAFE_ACTION_TRUNCATED" else 75.0
     elif truncated and reason not in {"INPUT_STALE", "OPERATOR_TRUNCATED"}:
-        reward -= 25.0
+        reward -= 20.0
     return reward
 
 
@@ -91,7 +122,10 @@ class EpisodeSummary:
     session_id: str
     total_reward: float
     steps: int
-    completed_waypoints: int
+    start_mission_index: int
+    ending_mission_index: int
+    waypoints_completed: int
+    full_route: bool
     completed: bool
     collision: bool
     timed_out: bool
@@ -104,24 +138,104 @@ class EpisodeSummary:
     @property
     def passed(self) -> bool:
         return (
-            self.completed
+            self.full_route
+            and self.completed
             and not self.collision
             and not self.timed_out
             and not self.no_safe_action
-            and self.completed_waypoints == 13
+            and self.start_mission_index == 0
+            and self.ending_mission_index == 13
+            and self.waypoints_completed == 13
         )
+
+
+@dataclass(frozen=True)
+class TrainingDiagnostics:
+    attempted_updates: int
+    applied_updates: int
+    critic_loss: Optional[float]
+    actor_loss: Optional[float]
+    actor_objective: str
+    behavior_clone_loss: Optional[float]
+    alpha: Optional[float]
+    entropy: Optional[float]
 
 
 @dataclass(frozen=True)
 class OfflineEpisode:
     transitions: tuple[SequenceTransition, ...]
     summary: EpisodeSummary
+    training: Optional[TrainingDiagnostics]
 
 
 @dataclass(frozen=True)
 class _PendingAction:
     trace: RuntimeTrainingTrace
     previous_control: Control
+
+
+def _guided_corridor_action(
+    cross_track_m: float,
+    heading_error_rad: float,
+    safe_action_mask: tuple[bool, ...],
+) -> int:
+    error = heading_error_rad - math.atan(0.5 * cross_track_m)
+    if error > 0.3:
+        preference = (0, 1, 2, 3, 4)
+    elif error > 0.06:
+        preference = (1, 0, 2, 3, 4)
+    elif error < -0.3:
+        preference = (4, 3, 2, 1, 0)
+    elif error < -0.06:
+        preference = (3, 4, 2, 1, 0)
+    else:
+        preference = (2, 1, 3, 0, 4)
+    return next(action for action in preference if safe_action_mask[action])
+
+
+class _GuidedExplorationPolicy:
+    """Use the frozen corridor to seed early off-policy exploration."""
+
+    def __init__(
+        self,
+        sac: RecurrentDiscreteSAC,
+    ) -> None:
+        self.sac = sac
+        self.forward_control_profile = sac.forward_control_profile
+        self.action_schema = sac.action_schema
+
+    @staticmethod
+    def _guided_action(
+        observation: LocalWaypointObservationV3,
+        safe_action_mask: tuple[bool, ...],
+    ) -> int:
+        return _guided_corridor_action(
+            observation.corridor_cross_track_m,
+            observation.corridor_heading_error_rad,
+            safe_action_mask,
+        )
+
+    def act(
+        self,
+        observation: LocalWaypointObservationV3,
+        safe_action_mask,
+        *,
+        hidden=None,
+        deterministic: bool = False,
+    ):
+        proposal, next_hidden = self.sac.act(
+            observation,
+            safe_action_mask,
+            hidden=hidden,
+            deterministic=deterministic,
+        )
+        mask = tuple(safe_action_mask)
+        if not deterministic:
+            proposal = replace(
+                proposal,
+                action=self._guided_action(observation, mask),
+            )
+        return proposal, next_hidden
 
 
 class _StaticLaser:
@@ -145,6 +259,13 @@ class _StaticLaser:
             72,
             dtype=np.float64,
         )
+        self._circles = np.asarray(
+            [
+                (obstacle.x, obstacle.y, obstacle.radius)
+                for obstacle in snapshot.circular_obstacles
+            ],
+            dtype=np.float64,
+        ).reshape((-1, 3))
 
     def scan(self, state: VesselState) -> tuple[float, ...]:
         headings = state.yaw + self._angles
@@ -168,6 +289,24 @@ class _StaticLaser:
         first_hit = np.argmax(blocked, axis=1)
         ranges = np.full(72, LASER_MAX_RANGE_M, dtype=np.float64)
         ranges[has_hit] = self._distances[first_hit[has_hit]]
+        if self._circles.size:
+            directions_x = np.cos(headings)[:, None]
+            directions_y = np.sin(headings)[:, None]
+            offset_x = self._circles[None, :, 0] - state.x
+            offset_y = self._circles[None, :, 1] - state.y
+            projection = offset_x * directions_x + offset_y * directions_y
+            perpendicular_sq = (
+                offset_x * offset_x
+                + offset_y * offset_y
+                - projection * projection
+            )
+            radius_sq = self._circles[None, :, 2] ** 2
+            intersects = (projection >= 0.0) & (perpendicular_sq <= radius_sq)
+            entry = projection - np.sqrt(
+                np.maximum(0.0, radius_sq - perpendicular_sq)
+            )
+            entry = np.where(intersects & (entry >= 0.0), entry, np.inf)
+            ranges = np.minimum(ranges, np.min(entry, axis=1))
         return tuple(float(value) for value in ranges)
 
 
@@ -199,6 +338,84 @@ class FixedMapSACTrainer:
             session_id=f"offline-training-{seed}",
         )
         self._laser = _StaticLaser(self._context.compiled_map.snapshot)
+
+    @staticmethod
+    def _expert_actions(batch: ReplaySequenceBatch) -> torch.Tensor:
+        expert_actions = batch.actions.clone()
+        valid = ~batch.padding_mask & batch.safe_action_mask.any(dim=-1)
+        for row, column in torch.nonzero(valid, as_tuple=False).tolist():
+            observation = batch.observations[row, column]
+            safe_mask = tuple(
+                bool(value)
+                for value in batch.safe_action_mask[row, column].tolist()
+            )
+            expert_actions[row, column] = _guided_corridor_action(
+                float(observation[157].item()),
+                float(observation[158].item()),
+                safe_mask,
+            )
+        return expert_actions
+
+    def learn_from_episode(
+        self,
+        transitions: tuple[SequenceTransition, ...],
+        *,
+        maximum_updates: int,
+        transitions_per_update: int,
+        demonstration: bool,
+    ) -> Optional[TrainingDiagnostics]:
+        if not transitions:
+            return None
+        if type(demonstration) is not bool:
+            raise ValueError("demonstration must be boolean")
+        self.replay.add_episode(transitions)
+        attempted = min(
+            maximum_updates,
+            max(1, len(transitions) // transitions_per_update),
+        )
+        results = []
+        for _ in range(attempted):
+            batch = self.replay.sample(batch_size=4, burn_in=32, unroll=64)
+            result = self.sac.update(
+                batch,
+                demonstration=demonstration,
+                expert_actions=(
+                    None
+                    if demonstration
+                    else self._expert_actions(batch)
+                ),
+            )
+            if result.get("updated") is True:
+                results.append(result)
+        if not results:
+            return TrainingDiagnostics(
+                attempted_updates=attempted,
+                applied_updates=0,
+                critic_loss=None,
+                actor_loss=None,
+                actor_objective=(
+                    "BEHAVIOR_CLONING"
+                    if demonstration
+                    else "SAC_WITH_DAGGER"
+                ),
+                behavior_clone_loss=None,
+                alpha=None,
+                entropy=None,
+            )
+
+        def average(name: str) -> float:
+            return sum(float(result[name]) for result in results) / len(results)
+
+        return TrainingDiagnostics(
+            attempted_updates=attempted,
+            applied_updates=len(results),
+            critic_loss=average("critic_loss"),
+            actor_loss=average("actor_loss"),
+            actor_objective=str(results[-1]["actor_objective"]),
+            behavior_clone_loss=average("behavior_clone_loss"),
+            alpha=float(results[-1]["alpha"]),
+            entropy=average("entropy"),
+        )
 
     def _randomized_dynamics(self, episode: int) -> PrototypeReducedDynamics:
         base = reduced_dynamics_from_profile(self.forward_profile)
@@ -288,8 +505,22 @@ class FixedMapSACTrainer:
             )
             if not context.compiled_map.snapshot.is_state_valid(state):
                 continue
+            mission_index = (
+                0
+                if full_route
+                else self._mission_index(corridor, segment_index)
+            )
+            if fixed_route_waypoint_reached(
+                context.compiled_map,
+                mission_index,
+                state,
+            ):
+                continue
             ranges = laser.scan(state)
-            if min(ranges) <= LASER_EMERGENCY_DISTANCE_M:
+            if min(ranges) <= laser_emergency_distance_m(
+                context.compiled_map.snapshot,
+                state,
+            ):
                 continue
             safe_mask, _, _ = supervisor.precheck(
                 state,
@@ -407,9 +638,18 @@ class FixedMapSACTrainer:
         )
         context = replace(provisional, start_index=mission_index)
         self.sac.forward_control_profile = self.forward_profile
+        guided_replay = (
+            training
+            and self.completed_training_episodes < GUIDED_REPLAY_EPISODES
+        )
+        policy = (
+            _GuidedExplorationPolicy(self.sac)
+            if guided_replay
+            else self.sac
+        )
         core = FixedMapControllerCore(
             context,
-            self.sac,
+            policy,
             dynamics=dynamics,
             deterministic_policy=deterministic,
         )
@@ -483,6 +723,7 @@ class FixedMapSACTrainer:
                     "MAP_INVALID",
                     "DYNAMICS_INVALID",
                     "LASER_EMERGENCY_STOP",
+                    "MOTION_STALLED",
                 }
                 no_safe = decision.reason == "NO_SAFE_ACTION_TRUNCATED"
                 break
@@ -512,7 +753,10 @@ class FixedMapSACTrainer:
             session_id=session_id,
             total_reward=total_reward,
             steps=executed_steps,
-            completed_waypoints=core.mission_index,
+            start_mission_index=mission_index,
+            ending_mission_index=core.mission_index,
+            waypoints_completed=max(0, core.mission_index - mission_index),
+            full_route=full_route,
             completed=completed,
             collision=collision,
             timed_out=end_reason == "TIME_LIMIT",
@@ -524,14 +768,20 @@ class FixedMapSACTrainer:
             ),
             end_reason=end_reason,
         )
+        training_diagnostics = None
         if training and transitions:
-            self.replay.add_episode(transitions)
             self.completed_training_episodes += 1
-            updates = min(32, max(1, len(transitions) // 16))
-            for _ in range(updates):
-                batch = self.replay.sample(batch_size=8, burn_in=8, unroll=16)
-                self.sac.update(batch)
-        return OfflineEpisode(tuple(transitions), summary)
+            training_diagnostics = self.learn_from_episode(
+                tuple(transitions),
+                maximum_updates=32,
+                transitions_per_update=16,
+                demonstration=guided_replay,
+            )
+        return OfflineEpisode(
+            tuple(transitions),
+            summary,
+            training_diagnostics,
+        )
 
 
 __all__ = [
@@ -539,5 +789,6 @@ __all__ = [
     "EpisodeSummary",
     "FixedMapSACTrainer",
     "OfflineEpisode",
+    "TrainingDiagnostics",
     "control_transition_reward",
 ]

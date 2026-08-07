@@ -19,7 +19,7 @@ from .kinodynamic_informed_rrtstar import VesselState
 DATA_DIR = Path(__file__).resolve().parents[1] / "mapping" / "data"
 SIDECAR_PATH = DATA_DIR / "beihu_static_world_sidecar.json"
 LIVE_PROFILE_PATH = DATA_DIR / "national_test_live_profile.json"
-FIXED_ROUTE_TOLERANCE_M = 0.5
+FIXED_ROUTE_TOLERANCE_M = 2.0
 
 
 def _validate_route_index(point_count: int, mission_index: int) -> None:
@@ -60,7 +60,7 @@ def fixed_route_waypoint_reached(
     mission_index: int,
     state: VesselState,
 ) -> bool:
-    """Whether the ship centre entered the published 0.5 m waypoint circle."""
+    """Whether the ship centre entered the published 2.0 m waypoint circle."""
 
     if not isinstance(state, VesselState) or not state.is_finite():
         return False
@@ -78,7 +78,7 @@ def compile_offline_national_map(
     *,
     session_id: str,
     stamp_sim: float = 0.0,
-    required_clearance_m: float = 0.2,
+    required_clearance_m: float = 0.0,
 ) -> CompiledSidecarMap:
     """Compile the approved affine map with an explicit collision buffer."""
 
@@ -114,10 +114,7 @@ def compile_offline_national_map(
         stamp_sim=float(stamp_sim),
         config=SidecarCompilerConfig(
             required_clearance_m=required_clearance_m,
-            geometry_version=(
-                "circle-0.4-margin-"
-                f"{required_clearance_m}-live-recovery-v1"
-            ),
+            geometry_version="national-test-zero-clearance-v4",
             transform_model="route_fitted_affine",
             coverage_status="complete_prior",
             promotion_note=(

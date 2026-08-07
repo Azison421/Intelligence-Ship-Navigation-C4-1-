@@ -159,17 +159,39 @@ def test_ten_fresh_no_safe_cycles_truncate_but_stale_does_not_count():
 def test_frozen_corridor_is_hash_bound_safe_and_keeps_thirteen_task_points():
     compiled = compile_offline_national_map(
         session_id="corridor-contract",
-        required_clearance_m=0.2,
+        required_clearance_m=0.0,
     )
     corridor = FrozenRouteCorridor.load(DEFAULT_CORRIDOR_PATH, compiled)
 
     assert corridor.schema_version == FROZEN_CORRIDOR_SCHEMA
-    assert corridor.required_clearance_m == pytest.approx(0.2)
+    assert corridor.required_clearance_m == pytest.approx(0.0)
     assert corridor.source_artifact_hash == compiled.snapshot.source_artifact_hash
     assert corridor.map_payload_hash == compiled.snapshot.payload_content_hash
     assert len(corridor.task_points) == 13
     assert len(corridor.task_anchors) == 13
     assert len(corridor.polyline) > len(corridor.task_points)
+    fixed_unity_spawn = (40.42961406169189, 63.72872199560271)
+    assert corridor.polyline[0] == pytest.approx(fixed_unity_spawn)
+    spawn_heading = math.atan2(
+        corridor.task_points[0][1] - fixed_unity_spawn[1],
+        corridor.task_points[0][0] - fixed_unity_spawn[0],
+    )
+    spawn_projection = corridor.project(
+        VesselState(
+            x=fixed_unity_spawn[0],
+            y=fixed_unity_spawn[1],
+            yaw=spawn_heading,
+            speed=0.0,
+            yaw_rate=0.0,
+        ),
+        0.0,
+        0,
+    )
+    assert spawn_projection.cross_track_error_m == pytest.approx(0.0)
+    assert spawn_projection.heading_error_rad == pytest.approx(0.0)
+    assert math.dist(fixed_unity_spawn, corridor.task_points[0]) == pytest.approx(
+        7.453897225323524
+    )
 
     for index, (task_point, anchor) in enumerate(
         zip(corridor.task_points, corridor.task_anchors)
@@ -184,13 +206,26 @@ def test_frozen_corridor_is_hash_bound_safe_and_keeps_thirteen_task_points():
             yaw_rate=0.0,
         )
         assert compiled.snapshot.is_state_valid(anchor_state)
-        assert compiled.snapshot.clearance_at(anchor_state) >= 0.2
+        assert compiled.snapshot.clearance_at(anchor_state) > 0.0
+        assert compiled.snapshot.required_clearance_at(anchor_state) == pytest.approx(
+            0.0
+        )
+
+    narrow_state = VesselState(
+        x=28.52,
+        y=99.21,
+        yaw=-2.4,
+        speed=0.1,
+        yaw_rate=0.0,
+    )
+    assert compiled.snapshot.required_clearance_at(narrow_state) == pytest.approx(0.0)
+    assert compiled.snapshot.is_state_valid(narrow_state)
 
 
 def test_corridor_projection_is_monotonic_across_narrow_segment_envelopes():
     compiled = compile_offline_national_map(
         session_id="corridor-envelope",
-        required_clearance_m=0.2,
+        required_clearance_m=0.0,
     )
     corridor = FrozenRouteCorridor.load(DEFAULT_CORRIDOR_PATH, compiled)
     previous_progress = 0.0

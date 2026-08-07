@@ -8,8 +8,10 @@ from types import SimpleNamespace
 
 from usvlib4ros.navigation.fixed_map_runtime import (
     FixedMapControllerCore,
+    MOTION_STALL_CYCLES,
     RuntimeInput,
     build_fixed_route_context,
+    laser_emergency_distance_m,
 )
 from usvlib4ros.navigation.waypoint_control import ACTION_SCHEMA_V3
 from usvlib4ros.planning import Control, VesselState
@@ -69,6 +71,7 @@ class _PermissiveSupervisor:
             final_action=policy_action,
             control=candidates[policy_action].control,
             candidate_mask=tuple(candidate_mask),
+            reasons=("SAFE",) * 5,
             reason="POLICY_ACTION_SAFE",
             stop=False,
             overridden=False,
@@ -138,6 +141,21 @@ def test_thirteen_waypoints_advance_without_stop_or_gru_reset():
     context, policy, core = _core()
     decisions = []
 
+    assert math.isclose(
+        laser_emergency_distance_m(
+            context.compiled_map.snapshot,
+            _state(context, 9),
+        ),
+        0.0,
+    )
+    assert math.isclose(
+        laser_emergency_distance_m(
+            context.compiled_map.snapshot,
+            _state(context, 10),
+        ),
+        0.0,
+    )
+
     for index in range(13):
         decisions.append(core.step(_sample(_state(context, index, stamp=index * 0.1))))
 
@@ -206,3 +224,18 @@ def test_stale_input_stops_but_resets_no_safe_failure_window():
     for _ in range(9):
         assert not core.step(_sample(state)).safety_truncated
     assert core.step(_sample(state)).safety_truncated
+
+
+def test_commanded_throttle_with_no_motion_truncates_as_stalled():
+    context, _, core = _core()
+    x, y = context.corridor.polyline[0]
+    state = VesselState(x=x, y=y, yaw=math.pi / 2, speed=0.0, yaw_rate=0.0)
+
+    assert core.step(_sample(state)).control is not None
+    for _ in range(MOTION_STALL_CYCLES - 1):
+        assert core.step(_sample(state)).reason == "POLICY_ACTION_SAFE"
+    stalled = core.step(_sample(state))
+
+    assert stalled.reason == "MOTION_STALLED"
+    assert stalled.safety_truncated
+    assert stalled.control is None

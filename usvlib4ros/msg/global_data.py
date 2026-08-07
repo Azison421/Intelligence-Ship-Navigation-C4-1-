@@ -33,6 +33,7 @@ class DictToObject:
 class Constants:
     class Request_Action:
         Set_Work_Model = 1
+        Set_Task = 30
         Reset = 31
         Parameter_Init = 20
 

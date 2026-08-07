@@ -19,7 +19,7 @@ ACTION_COUNT = 5
 LASER_COUNT = 72
 OBSERVATION_DIM = 166
 ACTION_SCHEMA = "five-calibrated-controls-v3"
-CHECKPOINT_FORMAT = "recurrent-sac-v2"
+CHECKPOINT_FORMAT = "recurrent-sac-v4"
 LOCAL_WAYPOINT_OBSERVATION_SCHEMA_V3 = "local-waypoint-observation-v3"
 REPLAY_SCHEMA_V3 = "national-test-replay-v3"
 
@@ -422,7 +422,11 @@ class SequenceReplay:
         for _ in range(batch_size):
             episode_id = self._rng.randrange(len(self._episodes))
             episode = self._episodes[episode_id]
-            start = self._rng.randrange(len(episode))
+            start = (
+                0
+                if self._rng.random() < 0.5
+                else self._rng.randrange(len(episode))
+            )
             row: dict[str, object] = {
                 "obs": [],
                 "next_obs": [],
@@ -464,7 +468,9 @@ class SequenceReplay:
                 row["truncated"].append(transition.truncated)
                 row["safe"].append(transition.observation.safe_action_mask)
                 row["next_safe"].append(transition.next_observation.safe_action_mask)
-                row["learning"].append(0.0 if offset < burn_in else 1.0)
+                row["learning"].append(
+                    1.0 if start == 0 or offset >= burn_in else 0.0
+                )
                 row["padding"].append(False)
                 row["reset"].append(transition.observation.hidden_reset or index == 0)
                 row["next_reset"].append(transition.next_observation.hidden_reset)
@@ -491,12 +497,32 @@ class SequenceReplay:
         )
 
 
+def _scale_observation_features(observations: Tensor) -> Tensor:
+    """Put heterogeneous V3 features on comparable fixed scales."""
+
+    scaled = observations.clone()
+    scaled[..., 0:72] = observations[..., 0:72].clamp(0.0, 20.0) / 20.0
+    scaled[..., 144:147] = observations[..., 144:147].clamp(0.0, 1.0)
+    scaled[..., 147] = observations[..., 147].clamp(-0.5, 0.5) / 0.5
+    scaled[..., 148] = observations[..., 148].clamp(-0.3, 0.3) / 0.3
+    scaled[..., 149] = observations[..., 149].clamp(-1.0, 1.0)
+    scaled[..., 150] = observations[..., 150].clamp(-0.1, 0.1) / 0.1
+    scaled[..., 151:155] = torch.tanh(observations[..., 151:155] / 5.0)
+    scaled[..., 157] = observations[..., 157].clamp(-1.0, 1.0)
+    scaled[..., 158] = observations[..., 158].clamp(-1.0, 1.0)
+    scaled[..., 160] = observations[..., 160].clamp(0.0, 5.0) / 5.0
+    return scaled
+
+
 class _RecurrentHead(nn.Module):
     def __init__(self, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
         self.input_norm = nn.LayerNorm(OBSERVATION_DIM)
         self.gru = nn.GRU(OBSERVATION_DIM, hidden_dim, batch_first=True)
-        self.head = nn.Linear(hidden_dim, output_dim)
+        self.head = nn.Linear(hidden_dim + OBSERVATION_DIM, output_dim)
+
+    def _output(self, encoded: Tensor, scaled: Tensor) -> Tensor:
+        return self.head(torch.cat((encoded, scaled), dim=-1))
 
     @staticmethod
     def _reset_hidden(
@@ -517,10 +543,11 @@ class _RecurrentHead(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if observations.ndim != 3 or observations.shape[-1] != OBSERVATION_DIM:
             raise ValueError("observations must have shape [batch, time, 166]")
-        normalized = self.input_norm(observations)
+        scaled = _scale_observation_features(observations)
+        normalized = self.input_norm(scaled)
         if reset_mask is None:
             encoded, output_hidden = self.gru(normalized, hidden)
-            return self.head(encoded), output_hidden
+            return self._output(encoded, scaled), output_hidden
         if reset_mask.shape != observations.shape[:2]:
             raise ValueError("reset_mask must match batch and time")
         outputs: list[Tensor] = []
@@ -534,7 +561,9 @@ class _RecurrentHead(nn.Module):
             encoded, current_hidden = self.gru(
                 normalized[:, index : index + 1], current_hidden
             )
-            outputs.append(self.head(encoded))
+            outputs.append(
+                self._output(encoded, scaled[:, index : index + 1])
+            )
         if not outputs:
             raise ValueError("observations must contain a time step")
         return torch.cat(outputs, dim=1), current_hidden
@@ -546,14 +575,17 @@ class _RecurrentHead(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if observations.ndim != 3 or reset_mask.shape != observations.shape[:2]:
             raise ValueError("sequence shapes are incompatible")
-        normalized = self.input_norm(observations)
+        scaled = _scale_observation_features(observations)
+        normalized = self.input_norm(scaled)
         outputs: list[Tensor] = []
         history: list[Tensor] = []
         hidden: Optional[Tensor] = None
         for index in range(observations.shape[1]):
             hidden = self._reset_hidden(hidden, reset_mask[:, index], normalized.dtype)
             encoded, hidden = self.gru(normalized[:, index : index + 1], hidden)
-            outputs.append(self.head(encoded))
+            outputs.append(
+                self._output(encoded, scaled[:, index : index + 1])
+            )
             history.append(hidden[0].unsqueeze(1))
         if not outputs:
             raise ValueError("observations must contain a time step")
@@ -572,13 +604,16 @@ class _RecurrentHead(nn.Module):
             or reset_mask.shape != observations.shape[:2]
         ):
             raise ValueError("next-observation history shapes are incompatible")
-        normalized = self.input_norm(observations)
+        scaled = _scale_observation_features(observations)
+        normalized = self.input_norm(scaled)
         outputs: list[Tensor] = []
         for index in range(observations.shape[1]):
             hidden = history[:, index : index + 1].transpose(0, 1)
             hidden = self._reset_hidden(hidden, reset_mask[:, index], normalized.dtype)
             encoded, _ = self.gru(normalized[:, index : index + 1], hidden)
-            outputs.append(self.head(encoded))
+            outputs.append(
+                self._output(encoded, scaled[:, index : index + 1])
+            )
         if not outputs:
             raise ValueError("observations must contain a time step")
         return torch.cat(outputs, dim=1)
@@ -795,8 +830,25 @@ class RecurrentDiscreteSAC:
         if torch.any(batch.terminated & batch.truncated).item():
             raise ValueError("a sample cannot be terminated and truncated")
 
-    def update(self, batch: ReplaySequenceBatch) -> dict[str, float | bool | int]:
+    def update(
+        self,
+        batch: ReplaySequenceBatch,
+        *,
+        demonstration: bool = False,
+        expert_actions: Optional[Tensor] = None,
+    ) -> dict[str, float | bool | int | str]:
+        if type(demonstration) is not bool:
+            raise ValueError("demonstration must be boolean")
         self._validate_batch(batch)
+        if expert_actions is not None and (
+            not isinstance(expert_actions, Tensor)
+            or expert_actions.shape != batch.actions.shape
+            or expert_actions.dtype != torch.long
+            or torch.any(
+                (expert_actions < 0) | (expert_actions >= ACTION_COUNT)
+            ).item()
+        ):
+            raise ValueError("expert actions are invalid")
         modules = (
             self.actor,
             self.critic1,
@@ -868,7 +920,103 @@ class RecurrentDiscreteSAC:
         actor_terms = (
             current_prob * (self.alpha.detach() * current_log_prob - current_min_q)
         ).sum(dim=-1)
-        actor_loss = actor_terms[actor_mask].mean()
+        behavior_actions = (
+            batch.actions if expert_actions is None else expert_actions
+        )
+        if expert_actions is not None:
+            expert_is_safe = batch.safe_action_mask.gather(
+                -1,
+                expert_actions.unsqueeze(-1),
+            ).squeeze(-1)
+            if torch.any(actor_mask & ~expert_is_safe).item():
+                raise ValueError("expert action must be safe")
+        behavior_mask = (
+            actor_mask
+            if demonstration or expert_actions is not None
+            else torch.zeros_like(actor_mask)
+        )
+        has_behavior_samples = behavior_mask.any().item()
+        behavior_clone_loss = logits.sum() * 0.0
+        if has_behavior_samples:
+            behavior_clone_sample_loss = -current_log_prob.gather(
+                -1, behavior_actions.unsqueeze(-1)
+            ).squeeze(-1)[behavior_mask]
+            demonstration_actions = behavior_actions[behavior_mask]
+            action_counts = torch.bincount(
+                demonstration_actions,
+                minlength=ACTION_COUNT,
+            ).to(dtype=behavior_clone_sample_loss.dtype)
+            present_actions = (action_counts > 0.0).sum().clamp_min(1)
+            class_weights = demonstration_actions.numel() / (
+                present_actions * action_counts.clamp_min(1.0)
+            )
+            action_sample_weights = class_weights.gather(
+                0,
+                demonstration_actions,
+            )
+
+            def clone_loss(sample_loss: Tensor) -> Tensor:
+                if expert_actions is not None:
+                    return sample_loss.mean()
+                balanced_loss = (sample_loss * action_sample_weights).mean()
+                return 0.5 * (sample_loss.mean() + balanced_loss)
+
+            sequence_behavior_clone_loss = clone_loss(
+                behavior_clone_sample_loss
+            )
+            reset_samples = batch.hidden_reset[behavior_mask]
+            behavior_clone_loss = sequence_behavior_clone_loss
+            if reset_samples.any().item():
+                behavior_clone_loss = (
+                    0.75 * sequence_behavior_clone_loss
+                    + 0.25 * behavior_clone_sample_loss[reset_samples].mean()
+                )
+            stateless_observations = batch.observations.reshape(
+                -1,
+                1,
+                OBSERVATION_DIM,
+            )
+            stateless_reset = torch.ones(
+                stateless_observations.shape[:2],
+                dtype=torch.bool,
+                device=stateless_observations.device,
+            )
+            stateless_logits, _ = self.actor(
+                stateless_observations,
+                stateless_reset,
+            )
+            _, stateless_log_prob, _ = self._masked_distribution(
+                stateless_logits,
+                batch.safe_action_mask.reshape(-1, 1, ACTION_COUNT),
+            )
+            stateless_log_prob = stateless_log_prob.reshape(
+                *batch.actions.shape,
+                ACTION_COUNT,
+            )
+            stateless_sample_loss = -stateless_log_prob.gather(
+                -1,
+                behavior_actions.unsqueeze(-1),
+            ).squeeze(-1)[behavior_mask]
+            behavior_clone_loss = 0.5 * (
+                behavior_clone_loss
+                + clone_loss(stateless_sample_loss)
+            )
+        if demonstration:
+            actor_loss = behavior_clone_loss
+            actor_objective = "BEHAVIOR_CLONING"
+        elif expert_actions is not None:
+            q_scale = current_min_q[actor_mask].abs().mean().clamp_min(1.0)
+            sac_weight = (
+                (0.25 - behavior_clone_loss.detach()) / 0.25
+            ).clamp(0.0, 1.0)
+            actor_loss = (
+                sac_weight * actor_terms[actor_mask].mean() / q_scale
+                + behavior_clone_loss
+            )
+            actor_objective = "SAC_WITH_DAGGER"
+        else:
+            actor_loss = actor_terms[actor_mask].mean()
+            actor_objective = "SOFT_ACTOR_CRITIC"
         entropy = -(current_prob * current_log_prob).sum(dim=-1)[actor_mask].mean()
         safe_count = batch.safe_action_mask.to(torch.float32).sum(dim=-1).clamp_min(1.0)
         desired_entropy = (0.5 * torch.log(safe_count))[actor_mask].mean().detach()
@@ -892,10 +1040,11 @@ class RecurrentDiscreteSAC:
             actor_loss.backward()
             self._finite_gradients((self.actor,), "actor gradients")
             self.actor_optimizer.step()
-            self.alpha_optimizer.zero_grad(set_to_none=True)
-            alpha_loss.backward()
-            self._finite_gradients((self,), "temperature gradients")
-            self.alpha_optimizer.step()
+            if not demonstration and expert_actions is None:
+                self.alpha_optimizer.zero_grad(set_to_none=True)
+                alpha_loss.backward()
+                self._finite_gradients((self,), "temperature gradients")
+                self.alpha_optimizer.step()
             self._soft_update(self.target_critic1, self.critic1, self.tau)
             self._soft_update(self.target_critic2, self.critic2, self.tau)
             _finite_modules(modules)
@@ -909,6 +1058,8 @@ class RecurrentDiscreteSAC:
             "updated": True,
             "critic_loss": float(critic_loss.detach().item()),
             "actor_loss": float(actor_loss.detach().item()),
+            "actor_objective": actor_objective,
+            "behavior_clone_loss": float(behavior_clone_loss.detach().item()),
             "alpha_loss": float(alpha_loss.detach().item()),
             "alpha": float(self.alpha.detach().item()),
             "entropy": float(entropy.detach().item()),
@@ -946,6 +1097,7 @@ class RecurrentDiscreteSAC:
             "alpha_optimizer": deepcopy(self.alpha_optimizer.state_dict()),
             "log_alpha": self.log_alpha.detach().clone(),
             "training_step": self.training_step,
+            "torch_rng_state": torch.get_rng_state().clone(),
         }
 
     def training_state_dict(self) -> dict[str, object]:
@@ -966,12 +1118,20 @@ class RecurrentDiscreteSAC:
             "alpha_optimizer",
             "log_alpha",
             "training_step",
+            "torch_rng_state",
         }
         if not isinstance(state, Mapping) or set(state) != required:
             raise ValueError("training state is incomplete")
         step = state.get("training_step")
         if isinstance(step, bool) or not isinstance(step, int) or step < 0:
             raise ValueError("training step is invalid")
+        rng_state = state.get("torch_rng_state")
+        if (
+            not isinstance(rng_state, Tensor)
+            or rng_state.dtype != torch.uint8
+            or rng_state.ndim != 1
+        ):
+            raise ValueError("training random state is invalid")
         _finite_value_tree(state, "training state")
         before = self._snapshot_training_state()
         try:
@@ -988,12 +1148,15 @@ class RecurrentDiscreteSAC:
         self.target_critic1.load_state_dict(state["target_critic1"])
         self.target_critic2.load_state_dict(state["target_critic2"])
         self.actor_optimizer.load_state_dict(state["actor_optimizer"])
+        for group in self.actor_optimizer.param_groups:
+            group["lr"] = self.actor_optimizer.defaults["lr"]
         self.critic1_optimizer.load_state_dict(state["critic1_optimizer"])
         self.critic2_optimizer.load_state_dict(state["critic2_optimizer"])
         self.alpha_optimizer.load_state_dict(state["alpha_optimizer"])
         with torch.no_grad():
             self.log_alpha.copy_(state["log_alpha"])
         self.training_step = int(state["training_step"])
+        torch.set_rng_state(state["torch_rng_state"].cpu())
 
     def _finite_optimizer_states(self) -> None:
         for name, optimizer in (

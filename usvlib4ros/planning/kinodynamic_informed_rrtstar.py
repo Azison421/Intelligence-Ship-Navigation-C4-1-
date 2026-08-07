@@ -253,6 +253,51 @@ class CircularObstacle:
 
 
 @dataclass(frozen=True)
+class LocalClearanceZone:
+    """A map region where a verified narrow passage uses a smaller buffer."""
+
+    start_x: float
+    start_y: float
+    end_x: float
+    end_y: float
+    half_width: float
+    required_clearance: float
+
+    def __post_init__(self) -> None:
+        if (
+            not _finite_all(
+                (
+                    self.start_x,
+                    self.start_y,
+                    self.end_x,
+                    self.end_y,
+                    self.half_width,
+                    self.required_clearance,
+                )
+            )
+            or self.half_width <= 0.0
+            or self.required_clearance < 0.0
+            or hypot(self.end_x - self.start_x, self.end_y - self.start_y)
+            <= 1e-9
+        ):
+            raise ValueError("local clearance zone geometry is invalid")
+
+    def contains(self, x: float, y: float) -> bool:
+        edge_x = self.end_x - self.start_x
+        edge_y = self.end_y - self.start_y
+        squared = edge_x * edge_x + edge_y * edge_y
+        fraction = _clamp(
+            ((x - self.start_x) * edge_x + (y - self.start_y) * edge_y)
+            / squared,
+            0.0,
+            1.0,
+        )
+        nearest_x = self.start_x + fraction * edge_x
+        nearest_y = self.start_y + fraction * edge_y
+        return hypot(x - nearest_x, y - nearest_y) <= self.half_width + 1e-9
+
+
+@dataclass(frozen=True)
 class PlanningMapSnapshot:
     """Immutable research snapshot; unknown cells are conservatively blocked."""
 
@@ -270,6 +315,7 @@ class PlanningMapSnapshot:
     payload_content_hash: str = ""
     compiler_config_hash: str = "planning-grid-v1"
     circular_obstacles: tuple[CircularObstacle, ...] = ()
+    local_clearance_zones: tuple[LocalClearanceZone, ...] = ()
     vessel_capsule_length: float = 0.0
     vessel_capsule_width: float = 0.0
     geometry_version: str = "circle-v1"
@@ -290,6 +336,20 @@ class PlanningMapSnapshot:
         ):
             raise ValueError("circular obstacles must use CircularObstacle")
         object.__setattr__(self, "circular_obstacles", normalized_obstacles)
+        try:
+            normalized_clearance_zones = tuple(self.local_clearance_zones)
+        except TypeError as exc:
+            raise ValueError("local clearance zones must be a sequence") from exc
+        if any(
+            not isinstance(zone, LocalClearanceZone)
+            for zone in normalized_clearance_zones
+        ):
+            raise ValueError("local clearance zones must use LocalClearanceZone")
+        object.__setattr__(
+            self,
+            "local_clearance_zones",
+            normalized_clearance_zones,
+        )
         if not self.snapshot_id or not self.session_id or not self.map_frame:
             raise ValueError("map identity fields must be non-empty")
         if (
@@ -311,6 +371,11 @@ class PlanningMapSnapshot:
             raise ValueError("map geometry and timestamp must be finite")
         if self.resolution <= 0.0 or self.footprint_radius < 0.0 or self.required_clearance < 0.0:
             raise ValueError("map geometry bounds are invalid")
+        if any(
+            zone.required_clearance > self.required_clearance
+            for zone in normalized_clearance_zones
+        ):
+            raise ValueError("local clearance zones must only reduce the map buffer")
         if not self.source_artifact_hash or not self.compiler_config_hash:
             raise ValueError("map artifact and compiler hashes are required")
         if (
@@ -357,6 +422,7 @@ class PlanningMapSnapshot:
         payload_content_hash: str = "",
         compiler_config_hash: str = "planning-grid-v1",
         circular_obstacles: Sequence[CircularObstacle] = (),
+        local_clearance_zones: Sequence[LocalClearanceZone] = (),
         vessel_capsule_length: float = 0.0,
         vessel_capsule_width: float = 0.0,
         geometry_version: str = "circle-v1",
@@ -376,6 +442,7 @@ class PlanningMapSnapshot:
             payload_content_hash=payload_content_hash,
             compiler_config_hash=compiler_config_hash,
             circular_obstacles=tuple(circular_obstacles),
+            local_clearance_zones=tuple(local_clearance_zones),
             vessel_capsule_length=vessel_capsule_length,
             vessel_capsule_width=vessel_capsule_width,
             geometry_version=geometry_version,
@@ -405,6 +472,16 @@ class PlanningMapSnapshot:
                     )
                     if self.vessel_capsule_length > 0.0
                     else ()
+                ),
+                *(
+                    "clearance-zone:"
+                    f"{zone.start_x:.17g},"
+                    f"{zone.start_y:.17g},"
+                    f"{zone.end_x:.17g},"
+                    f"{zone.end_y:.17g},"
+                    f"{zone.half_width:.17g},"
+                    f"{zone.required_clearance:.17g}"
+                    for zone in self.local_clearance_zones
                 ),
                 *(
                     "circle:"
@@ -590,11 +667,18 @@ class PlanningMapSnapshot:
         grid_clearance = min(boundary, obstacle)
         return min(grid_clearance, circle_clearance)
 
+    def required_clearance_at(self, state: VesselState) -> float:
+        required = self.required_clearance
+        for zone in self.local_clearance_zones:
+            if zone.contains(state.x, state.y):
+                required = min(required, zone.required_clearance)
+        return required
+
     def is_state_valid(self, state: VesselState) -> bool:
         if state.frame_id != self.map_frame or state.health != "healthy":
             return False
         return self._cell_for(state.x, state.y) is not None and (
-            self.clearance_at(state) > self.required_clearance + 1e-9
+            self.clearance_at(state) > self.required_clearance_at(state) + 1e-9
         )
 
     def check_motion(self, states: Sequence[VesselState]) -> MotionCheck:
@@ -3686,10 +3770,12 @@ class KinodynamicInformedRRTStarPlanner:
 
 
 __all__ = [
+    "CircularObstacle",
     "Control",
     "CostConfig",
     "GoalRegion",
     "KinodynamicInformedRRTStarPlanner",
+    "LocalClearanceZone",
     "MAX_EDGE_DURATION_S",
     "MotionCheck",
     "PlanResult",
